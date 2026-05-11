@@ -28,6 +28,7 @@ export type DenyListConfig = Pick<
   | "denyListCountries"
   | "denyListRegions"
   | "denyListExcludeCategories"
+  | "customDenyList"
   | "dictionaries"
 >;
 
@@ -193,6 +194,7 @@ const getPersonStopwords = (ctx: PipelineContext): ReadonlySet<string> =>
   ctx.personStopwords ?? EMPTY_PERSON_STOPWORDS;
 
 const PERSON_CHAIN_BREAK_RE = /[!?;:]|,/u;
+const WORD_CHAR_RE = /[\p{L}\p{N}]/u;
 
 const isInitialContinuationGap = (text: string, gap: string): boolean =>
   (/^\p{Lu}$/u.test(text) && /^\.[^\S\n]{1,2}$/u.test(gap)) ||
@@ -201,11 +203,17 @@ const isInitialContinuationGap = (text: string, gap: string): boolean =>
 /**
  * Source tag for each pattern in the automaton.
  * "deny-list" = standard deny list entry
+ * "custom-deny-list" = caller-owned exact term
  * "first-name" = name corpus first name
  * "surname" = name corpus surname
  * "title" = academic/professional title
  */
-type PatternSource = "deny-list" | "first-name" | "surname" | "title";
+type PatternSource =
+  | "deny-list"
+  | "custom-deny-list"
+  | "first-name"
+  | "surname"
+  | "title";
 
 /**
  * Pre-built deny list data. Constructed once by
@@ -221,6 +229,8 @@ export type DenyListData = {
    * is both a person name and a city name).
    */
   labels: string[][];
+  /** Maps pattern index → labels contributed by custom entries. */
+  customLabels: string[][];
   /** Maps pattern index → original pattern text. */
   originals: string[];
   /** Maps pattern index → source types (plural). */
@@ -257,9 +267,11 @@ export const buildDenyList = async (
   const dictionaries = config.dictionaries;
   const hasDenyList = dictionaries?.denyList && dictionaries?.denyListMeta;
   const hasCities = dictionaries?.cities && dictionaries.cities.length > 0;
+  const hasCustomDenyList =
+    config.customDenyList !== undefined && config.customDenyList.length > 0;
 
   // No dictionary data available — skip deny-list building
-  if (!hasDenyList && !hasCities) {
+  if (!hasDenyList && !hasCities && !hasCustomDenyList) {
     // Still build name corpus entries if available
     return buildNameCorpusOnly(config, ctx);
   }
@@ -274,18 +286,24 @@ export const buildDenyList = async (
 
   const patternList: string[] = [];
   const labelList: string[][] = [];
+  const customLabelList: string[][] = [];
   const sourceList: PatternSource[][] = [];
   // Maps lowercased pattern → index in patternList
   // for accumulating labels from multiple dictionaries
   const patternIndex = new Map<string, number>();
 
-  const addDenyListEntry = (entry: string, label: string) => {
-    // Strip | and \ only — these caused the 12K FP
+  const addDenyListEntry = (
+    entry: string,
+    label: string,
+    source: PatternSource = "deny-list",
+  ) => {
+    // Strip | and \ only for curated data — these caused the 12K FP
     // bug (| creates empty regex alternation, \ is
-    // an escape prefix). Other chars like () [] are
-    // kept since they appear in real dictionary
-    // entries and are matched literally by AC.
-    const normalized = normalizeForSearch(entry).replace(/[|\\]/g, "");
+    // an escape prefix). Caller-owned custom terms stay exact.
+    const normalized =
+      source === "custom-deny-list"
+        ? normalizeForSearch(entry)
+        : normalizeForSearch(entry).replace(/[|\\]/g, "");
     if (normalized.length === 0) {
       return;
     }
@@ -295,14 +313,21 @@ export const buildDenyList = async (
       if (!labelList[existing]!.includes(label)) {
         labelList[existing]!.push(label);
       }
-      if (!sourceList[existing]!.includes("deny-list")) {
-        sourceList[existing]!.push("deny-list");
+      if (!sourceList[existing]!.includes(source)) {
+        sourceList[existing]!.push(source);
+      }
+      if (
+        source === "custom-deny-list" &&
+        !customLabelList[existing]!.includes(label)
+      ) {
+        customLabelList[existing]!.push(label);
       }
     } else {
       patternIndex.set(lower, patternList.length);
       patternList.push(normalized);
       labelList.push([label]);
-      sourceList.push(["deny-list"]);
+      customLabelList.push(source === "custom-deny-list" ? [label] : []);
+      sourceList.push([source]);
     }
   };
 
@@ -344,6 +369,15 @@ export const buildDenyList = async (
     }
   }
 
+  if (hasCustomDenyList) {
+    for (const entry of config.customDenyList!) {
+      addDenyListEntry(entry.value, entry.label, "custom-deny-list");
+      for (const variant of entry.variants ?? []) {
+        addDenyListEntry(variant, entry.label, "custom-deny-list");
+      }
+    }
+  }
+
   // Add name corpus entries — accumulate labels
   // for entries that already exist from deny-list.
   appendNameCorpusEntries(
@@ -361,6 +395,7 @@ export const buildDenyList = async (
 
   return {
     labels: labelList,
+    customLabels: customLabelList,
     originals: patternList,
     sources: sourceList,
   };
@@ -388,6 +423,7 @@ const buildNameCorpusOnly = (
 
   const patternList: string[] = [];
   const labelList: string[][] = [];
+  const customLabelList: string[][] = [];
   const sourceList: PatternSource[][] = [];
   const patternIndex = new Map<string, number>();
 
@@ -406,6 +442,7 @@ const buildNameCorpusOnly = (
 
   return {
     labels: labelList,
+    customLabels: customLabelList,
     originals: patternList,
     sources: sourceList,
   };
@@ -484,8 +521,30 @@ type RawMatch = {
   end: number;
   /** All labels for this pattern (e.g., ["person", "address"]). */
   labels: string[];
+  customLabels: string[];
+  sources: PatternSource[];
   text: string;
   patternIdx: number;
+};
+
+const customMatchHasValidEdges = (
+  fullText: string,
+  start: number,
+  end: number,
+  pattern: string,
+): boolean => {
+  if (!WORD_CHAR_RE.test(pattern)) {
+    return true;
+  }
+  const prev = fullText[start - 1] ?? "";
+  const next = fullText[end] ?? "";
+  if (WORD_CHAR_RE.test(prev)) {
+    return false;
+  }
+  if (WORD_CHAR_RE.test(next)) {
+    return false;
+  }
+  return true;
 };
 
 /**
@@ -546,35 +605,50 @@ export const processDenyListMatches = (
     }
 
     const localIdx = idx - sliceStart;
-
-    const sourceChar = fullText[match.start] ?? "";
-    if (!UPPER_START_RE.test(sourceChar)) {
-      continue;
-    }
+    const sources = data.sources[localIdx] ?? [];
 
     // Use original text for display; normalized was
     // only for the AC search.
     const matchText = fullText.slice(match.start, match.end);
+    const sourceChar = fullText[match.start] ?? "";
     const keyword = matchText.toLowerCase();
-    if (getStopwords(ctx).has(keyword) || getAllowList(ctx).has(keyword)) {
-      continue;
-    }
-
-    // Skip ALL-CAPS tokens (likely acronyms, not PII)
-    // unless surrounding context is also all-caps
-    if (ALL_UPPER_RE.test(matchText)) {
-      continue;
-    }
 
     const labels = data.labels[localIdx];
-    if (!labels || labels.length === 0) {
+    const pattern = data.originals[localIdx] ?? "";
+    const customPatternLabels = data.customLabels[localIdx] ?? [];
+    const customEdgesAreValid = customMatchHasValidEdges(
+      fullText,
+      match.start,
+      match.end,
+      pattern,
+    );
+    const customLabels = customEdgesAreValid ? customPatternLabels : [];
+    if ((!labels || labels.length === 0) && customLabels.length === 0) {
+      continue;
+    }
+
+    const passesCuratedFilters =
+      UPPER_START_RE.test(sourceChar) &&
+      !getStopwords(ctx).has(keyword) &&
+      !getAllowList(ctx).has(keyword) &&
+      !ALL_UPPER_RE.test(matchText);
+    const curatedLabels = passesCuratedFilters
+      ? (labels ?? []).filter(
+          (label) =>
+            !customPatternLabels.includes(label) && customEdgesAreValid,
+        )
+      : [];
+
+    if (curatedLabels.length === 0 && customLabels.length === 0) {
       continue;
     }
 
     const entry: RawMatch = {
       start: match.start,
       end: match.end,
-      labels,
+      labels: curatedLabels,
+      customLabels,
+      sources,
       text: matchText,
       patternIdx: localIdx,
     };
@@ -597,23 +671,32 @@ export const processDenyListMatches = (
       continue;
     }
 
-    const hasPerson = first.labels.includes("person");
-    const nonPersonLabels = first.labels.filter((l) => l !== "person");
-
-    // Person hits go to chain scoring (Pass 2b).
-    // Skip words that are valid places/orgs but not
-    // person names (months, states, languages).
-    if (hasPerson) {
-      const keyword = first.text.toLowerCase();
-      if (!getPersonStopwords(ctx).has(keyword)) {
-        for (const m of matches) {
-          nameHits.push(m);
-        }
+    for (const m of matches) {
+      for (const label of m.customLabels) {
+        results.push({
+          start: m.start,
+          end: m.end,
+          label,
+          text: m.text,
+          score: 0.9,
+          source: DETECTION_SOURCES.DENY_LIST,
+          sourceDetail: "custom-deny-list",
+        });
       }
     }
 
-    // Emit entities for all non-person labels
+    // Curated labels are evaluated per match because
+    // custom-only matches can share a pattern with
+    // curated matches while failing curated FP filters.
     for (const m of matches) {
+      if (m.labels.includes("person")) {
+        const keyword = m.text.toLowerCase();
+        if (!getPersonStopwords(ctx).has(keyword)) {
+          nameHits.push(m);
+        }
+      }
+
+      const nonPersonLabels = m.labels.filter((l) => l !== "person");
       for (const label of nonPersonLabels) {
         results.push({
           start: m.start,
@@ -793,6 +876,9 @@ const TRAILING_WORD_EXCLUSIONS: ReadonlySet<string> = new Set([
 const extendCityDistricts = (entities: Entity[], fullText: string): void => {
   for (const entity of entities) {
     if (entity.label !== "address") {
+      continue;
+    }
+    if (entity.sourceDetail === "custom-deny-list") {
       continue;
     }
 

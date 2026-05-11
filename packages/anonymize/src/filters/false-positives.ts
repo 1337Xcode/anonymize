@@ -150,6 +150,10 @@ export const loadGenericRoles = (
 const getGenericRoles = (ctx: PipelineContext): ReadonlySet<string> =>
   ctx.genericRoles ?? EMPTY_GENERIC_ROLES;
 
+const isCallerOwnedEntity = (entity: Entity): boolean =>
+  entity.sourceDetail === "custom-deny-list" ||
+  entity.sourceDetail === "custom-regex";
+
 /**
  * Filter out entities that are likely false positives:
  * template placeholders, clause/section numbers,
@@ -167,6 +171,11 @@ export const filterFalsePositives = (
   const roles = getGenericRoles(ctx);
 
   for (const entity of entities) {
+    if (isCallerOwnedEntity(entity)) {
+      filtered.push(entity);
+      continue;
+    }
+
     const normalized = normalizeEntity(entity);
     if (!normalized) {
       continue;
@@ -175,6 +184,11 @@ export const filterFalsePositives = (
     // Strip leading ". " artifacts from trigger extraction
     // after abbreviations ("dat. nar.", "č.p.").
     const trimmed = normalized.text;
+
+    if (isCallerOwnedEntity(normalized)) {
+      filtered.push(normalized);
+      continue;
+    }
 
     if (TEMPLATE_PLACEHOLDER_RE.test(trimmed)) {
       continue;

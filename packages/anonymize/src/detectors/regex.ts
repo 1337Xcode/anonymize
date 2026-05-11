@@ -97,6 +97,7 @@ const HONORIFIC_ALT = [...HONORIFICS]
 export type RegexMeta = {
   label: string;
   score: number;
+  sourceDetail?: Entity["sourceDetail"];
   /** Post-match stdnum validator for confirmation. */
   validator?: Validator;
 };
@@ -850,7 +851,11 @@ export const processRegexMatches = (
     if (!meta) {
       continue;
     }
-    if (meta.label === "phone number" && match.text.length < MIN_PHONE_LENGTH) {
+    if (
+      meta.sourceDetail !== "custom-regex" &&
+      meta.label === "phone number" &&
+      match.text.length < MIN_PHONE_LENGTH
+    ) {
       continue;
     }
 
@@ -867,14 +872,18 @@ export const processRegexMatches = (
       }
     }
 
-    results.push({
+    const entity: Entity = {
       start: match.start,
       end: match.end,
       label: meta.label,
       text: match.text,
       score: meta.score,
       source: DETECTION_SOURCES.REGEX,
-    });
+    };
+    if (meta.sourceDetail) {
+      entity.sourceDetail = meta.sourceDetail;
+    }
+    results.push(entity);
   }
 
   return results;

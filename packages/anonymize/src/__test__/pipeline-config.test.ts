@@ -111,6 +111,747 @@ describe("pipeline config semantics", () => {
     ).toBe(true);
   });
 
+  test("custom deny-list entries are matched without published dictionaries", async () => {
+    const entities = await detect("Project Nebula appears in the agreement.", {
+      enableDenyList: true,
+      customDenyList: [
+        {
+          value: "Project Nebula",
+          label: "organization",
+          variants: ["Nebula Programme"],
+        },
+      ],
+      labels: ["organization"],
+    });
+    expect(entities).toEqual([
+      expect.objectContaining({
+        label: "organization",
+        text: "Project Nebula",
+        source: "deny-list",
+      }),
+    ]);
+  });
+
+  test("custom deny-list entries preserve caller-owned exact terms", async () => {
+    const entities = await detect(
+      "Use api-key for ACME, DOMAIN\\user, foo|bar, 2024, 3.2.1, Buyer, .env, @acme, C++, and :ACME;.",
+      {
+        enableDenyList: true,
+        customDenyList: [
+          {
+            value: "api-key",
+            label: "secret",
+          },
+          {
+            value: "ACME",
+            label: "organization",
+          },
+          {
+            value: "DOMAIN\\user",
+            label: "account",
+          },
+          {
+            value: "foo|bar",
+            label: "token",
+          },
+          {
+            value: "2024",
+            label: "project",
+          },
+          {
+            value: "3.2.1",
+            label: "matter",
+          },
+          {
+            value: "Buyer",
+            label: "organization",
+          },
+          {
+            value: ".env",
+            label: "file",
+          },
+          {
+            value: "@acme",
+            label: "handle",
+          },
+          {
+            value: "C++",
+            label: "language",
+          },
+          {
+            value: ":ACME;",
+            label: "token",
+          },
+        ],
+        labels: [
+          "account",
+          "file",
+          "handle",
+          "language",
+          "matter",
+          "secret",
+          "organization",
+          "project",
+          "token",
+        ],
+      },
+    );
+
+    expect(entities).toEqual([
+      expect.objectContaining({
+        label: "secret",
+        text: "api-key",
+        source: "deny-list",
+        sourceDetail: "custom-deny-list",
+      }),
+      expect.objectContaining({
+        label: "organization",
+        text: "ACME",
+        source: "deny-list",
+        sourceDetail: "custom-deny-list",
+      }),
+      expect.objectContaining({
+        label: "account",
+        text: "DOMAIN\\user",
+        source: "deny-list",
+        sourceDetail: "custom-deny-list",
+      }),
+      expect.objectContaining({
+        label: "token",
+        text: "foo|bar",
+        source: "deny-list",
+        sourceDetail: "custom-deny-list",
+      }),
+      expect.objectContaining({
+        label: "project",
+        text: "2024",
+        source: "deny-list",
+        sourceDetail: "custom-deny-list",
+      }),
+      expect.objectContaining({
+        label: "matter",
+        text: "3.2.1",
+        source: "deny-list",
+        sourceDetail: "custom-deny-list",
+      }),
+      expect.objectContaining({
+        label: "organization",
+        text: "Buyer",
+        source: "deny-list",
+        sourceDetail: "custom-deny-list",
+      }),
+      expect.objectContaining({
+        label: "file",
+        text: ".env",
+        source: "deny-list",
+        sourceDetail: "custom-deny-list",
+      }),
+      expect.objectContaining({
+        label: "handle",
+        text: "@acme",
+        source: "deny-list",
+        sourceDetail: "custom-deny-list",
+      }),
+      expect.objectContaining({
+        label: "language",
+        text: "C++",
+        source: "deny-list",
+        sourceDetail: "custom-deny-list",
+      }),
+      expect.objectContaining({
+        label: "token",
+        text: ":ACME;",
+        source: "deny-list",
+        sourceDetail: "custom-deny-list",
+      }),
+    ]);
+  });
+
+  test("plain custom deny-list entries keep token boundaries", async () => {
+    const entities = await detect(
+      "annual review for Joanne, ABC++, C++foo, A, Ann, and C++.",
+      {
+        enableDenyList: true,
+        customDenyList: [
+          {
+            value: "Ann",
+            label: "person",
+          },
+          {
+            value: "A",
+            label: "grade",
+          },
+          {
+            value: "C++",
+            label: "language",
+          },
+        ],
+        labels: ["grade", "language", "person"],
+      },
+    );
+
+    expect(entities).toEqual([
+      expect.objectContaining({
+        label: "grade",
+        text: "A",
+        source: "deny-list",
+        sourceDetail: "custom-deny-list",
+      }),
+      expect.objectContaining({
+        label: "person",
+        text: "Ann",
+        source: "deny-list",
+        sourceDetail: "custom-deny-list",
+      }),
+      expect.objectContaining({
+        label: "language",
+        text: "C++",
+        source: "deny-list",
+        sourceDetail: "custom-deny-list",
+      }),
+    ]);
+  });
+
+  test("custom deny-list monetary amounts skip amount-word widening", async () => {
+    const entities = await detect("Invoice 1 529,-Kč (slovy jeden tisíc).", {
+      enableDenyList: true,
+      customDenyList: [
+        {
+          value: "1 529,-Kč",
+          label: "monetary amount",
+        },
+      ],
+      labels: ["monetary amount"],
+    });
+
+    expect(entities).toEqual([
+      expect.objectContaining({
+        label: "monetary amount",
+        text: "1 529,-Kč",
+        source: "deny-list",
+        sourceDetail: "custom-deny-list",
+      }),
+    ]);
+  });
+
+  test("custom deny-list labels do not relax curated boundaries", async () => {
+    const entities = await detect("ABC++ and C++foo and C++ are listed.", {
+      enableDenyList: true,
+      customDenyList: [
+        {
+          value: "C++",
+          label: "language",
+        },
+      ],
+      labels: ["language", "technology"],
+      dictionaries: {
+        denyList: {
+          "technology/test": ["C++"],
+        },
+        denyListMeta: {
+          "technology/test": {
+            label: "technology",
+            category: "Organizations",
+            country: null,
+          },
+        },
+      },
+    });
+
+    expect(
+      entities.some(
+        (entity) =>
+          entity.label === "language" &&
+          entity.text === "C++" &&
+          entity.sourceDetail === "custom-deny-list",
+      ),
+    ).toBe(true);
+    expect(entities.some((entity) => entity.text !== "C++")).toBe(false);
+  });
+
+  test("custom deny-list labels do not suppress later curated matches", async () => {
+    const entities = await detect("acme and Acme are both mentioned.", {
+      enableDenyList: true,
+      customDenyList: [
+        {
+          value: "Acme",
+          label: "project",
+        },
+      ],
+      labels: [],
+      dictionaries: {
+        denyList: {
+          "organizations/test": ["Acme"],
+        },
+        denyListMeta: {
+          "organizations/test": {
+            label: "organization",
+            category: "Organizations",
+            country: null,
+          },
+        },
+      },
+    });
+
+    expect(
+      entities.some(
+        (entity) => entity.label === "project" && entity.text === "acme",
+      ),
+    ).toBe(true);
+    expect(
+      entities.some(
+        (entity) => entity.label === "organization" && entity.text === "Acme",
+      ),
+    ).toBe(true);
+    expect(
+      entities.some(
+        (entity) => entity.label === "organization" && entity.text === "acme",
+      ),
+    ).toBe(false);
+  });
+
+  test("custom deny-list labels do not promote merged corpus labels", async () => {
+    const entities = await detect("Jan was used as the project codename.", {
+      enableDenyList: true,
+      enableNameCorpus: true,
+      customDenyList: [
+        {
+          value: "Jan",
+          label: "project",
+        },
+      ],
+      labels: [],
+      dictionaries: {
+        firstNames: {
+          en: ["Jan"],
+        },
+      },
+    });
+
+    expect(entities).toEqual([
+      expect.objectContaining({
+        label: "project",
+        text: "Jan",
+        source: "deny-list",
+        sourceDetail: "custom-deny-list",
+      }),
+    ]);
+  });
+
+  test("custom deny-list organizations do not seed propagation", async () => {
+    const entities = await detect("Acme s.r.o. signed. Acme later paid.", {
+      enableDenyList: true,
+      enableCoreference: true,
+      customDenyList: [
+        {
+          value: "Acme s.r.o.",
+          label: "organization",
+        },
+      ],
+      labels: ["organization"],
+    });
+
+    expect(entities).toEqual([
+      expect.objectContaining({
+        label: "organization",
+        text: "Acme s.r.o.",
+        source: "deny-list",
+        sourceDetail: "custom-deny-list",
+      }),
+    ]);
+  });
+
+  test("custom deny-list organizations do not seed coreference", async () => {
+    const entities = await detect(
+      'Acme Incorporated (hereinafter "Acme") later paid Acme.',
+      {
+        enableDenyList: true,
+        enableCoreference: true,
+        customDenyList: [
+          {
+            value: "Acme Incorporated",
+            label: "organization",
+          },
+        ],
+        labels: ["organization"],
+      },
+    );
+
+    expect(entities).toEqual([
+      expect.objectContaining({
+        label: "organization",
+        text: "Acme Incorporated",
+        source: "deny-list",
+        sourceDetail: "custom-deny-list",
+      }),
+    ]);
+  });
+
+  test("custom address deny-list entries preserve exact spans", async () => {
+    const entities = await detect("Office moved to 140 00 Praha 1 yesterday.", {
+      enableDenyList: true,
+      customDenyList: [
+        {
+          value: "Praha",
+          label: "address",
+        },
+      ],
+      labels: ["address"],
+    });
+
+    expect(entities).toEqual([
+      expect.objectContaining({
+        label: "address",
+        text: "Praha",
+        source: "deny-list",
+        sourceDetail: "custom-deny-list",
+      }),
+    ]);
+  });
+
+  test("custom address deny-list entries bypass role-prefix normalization", async () => {
+    const entities = await detect("Adresa: nájemce Praha.", {
+      enableDenyList: true,
+      customDenyList: [
+        {
+          value: "nájemce Praha",
+          label: "address",
+        },
+      ],
+      labels: ["address"],
+    });
+
+    expect(entities).toEqual([
+      expect.objectContaining({
+        label: "address",
+        text: "nájemce Praha",
+        source: "deny-list",
+        sourceDetail: "custom-deny-list",
+      }),
+    ]);
+  });
+
+  test("custom address deny-list entries do not anchor street-context expansion", async () => {
+    const entities = await detect(`${"x".repeat(200)} Ostrovní 225/1, Praha`, {
+      enableDenyList: true,
+      customDenyList: [
+        {
+          value: "Praha",
+          label: "address",
+        },
+      ],
+      labels: ["address"],
+    });
+
+    expect(entities).toEqual([
+      expect.objectContaining({
+        label: "address",
+        text: "Praha",
+        source: "deny-list",
+        sourceDetail: "custom-deny-list",
+      }),
+    ]);
+  });
+
+  test("adjacent custom deny-list entries preserve exact spans", async () => {
+    const entities = await detect("Reference ABC-DEF is listed.", {
+      enableDenyList: true,
+      customDenyList: [
+        {
+          value: "ABC",
+          label: "code",
+        },
+        {
+          value: "DEF",
+          label: "code",
+        },
+      ],
+      labels: ["code"],
+    });
+
+    expect(entities).toEqual([
+      expect.objectContaining({
+        label: "code",
+        text: "ABC",
+        source: "deny-list",
+        sourceDetail: "custom-deny-list",
+      }),
+      expect.objectContaining({
+        label: "code",
+        text: "DEF",
+        source: "deny-list",
+        sourceDetail: "custom-deny-list",
+      }),
+    ]);
+  });
+
+  test("custom regexes add caller-owned deterministic detectors", async () => {
+    const entities = await detect("Internal matter STLL-4821 is referenced.", {
+      enableRegex: true,
+      customRegexes: [
+        {
+          pattern: "\\bSTLL-[0-9]{4}\\b",
+          label: "matter reference",
+          score: 1,
+        },
+      ],
+      labels: ["matter reference"],
+    });
+    expect(entities).toEqual([
+      expect.objectContaining({
+        label: "matter reference",
+        text: "STLL-4821",
+        source: "regex",
+        sourceDetail: "custom-regex",
+      }),
+    ]);
+  });
+
+  test("custom regexes preserve caller-owned spans during merge", async () => {
+    const entities = await detect("Version 2024-01-02 is referenced.", {
+      enableRegex: true,
+      customRegexes: [
+        {
+          pattern: "\\d{4}",
+          label: "code",
+          score: 1,
+        },
+      ],
+      labels: [],
+    });
+
+    expect(
+      entities.some(
+        (entity) =>
+          entity.label === "code" &&
+          entity.text === "2024" &&
+          entity.sourceDetail === "custom-regex",
+      ),
+    ).toBe(true);
+  });
+
+  test("custom regexes preserve caller-owned match boundaries", async () => {
+    const entities = await detect("Token XABCY is referenced.", {
+      enableRegex: true,
+      customRegexes: [
+        {
+          pattern: "ABC",
+          label: "code",
+          score: 1,
+        },
+      ],
+      labels: ["code"],
+    });
+
+    expect(entities).toEqual([
+      expect.objectContaining({
+        label: "code",
+        text: "ABC",
+        source: "regex",
+        sourceDetail: "custom-regex",
+      }),
+    ]);
+  });
+
+  test("custom regexes skip boundary and amount widening", async () => {
+    const entities = await detect(
+      "Invoice 1 529,-Kč (slovy jeden tisíc) and ABC 2024-01-02.",
+      {
+        enableRegex: true,
+        customRegexes: [
+          {
+            pattern: "1 529,-Kč",
+            label: "monetary amount",
+            score: 1,
+          },
+          {
+            pattern: " ABC,?",
+            label: "date",
+            score: 1,
+          },
+        ],
+        labels: ["date", "monetary amount"],
+      },
+    );
+
+    expect(
+      entities.some(
+        (entity) =>
+          entity.label === "monetary amount" &&
+          entity.text === "1 529,-Kč" &&
+          entity.sourceDetail === "custom-regex",
+      ),
+    ).toBe(true);
+    expect(
+      entities.some(
+        (entity) =>
+          entity.label === "date" &&
+          entity.text === " ABC" &&
+          entity.sourceDetail === "custom-regex",
+      ),
+    ).toBe(true);
+    expect(entities.some((entity) => entity.text === "ABC 2024-01-02")).toBe(
+      false,
+    );
+  });
+
+  test("custom regexes skip hotword relabeling", async () => {
+    const entities = await detect("narozen dne 12.03.1990", {
+      enableRegex: true,
+      enableHotwordRules: true,
+      customRegexes: [
+        {
+          pattern: "12\\.03\\.1990",
+          label: "date",
+          score: 1,
+        },
+      ],
+      labels: ["date"],
+    });
+
+    expect(entities).toEqual([
+      expect.objectContaining({
+        label: "date",
+        text: "12.03.1990",
+        source: "regex",
+        sourceDetail: "custom-regex",
+      }),
+    ]);
+  });
+
+  test("unrequested custom regexes do not constrain address context", async () => {
+    const entities = await detect("Olbrachtova 1929/62, 140 00 Praha 4", {
+      enableRegex: true,
+      customRegexes: [
+        {
+          pattern: "Praha",
+          label: "person",
+          score: 1,
+        },
+      ],
+      labels: ["address"],
+    });
+
+    const address = entities.find((entity) => entity.label === "address");
+    expect(address).toBeDefined();
+    expect(address!.text).toContain("Olbrachtova 1929/62");
+    expect(address!.text).toContain("140 00 Praha 4");
+  });
+
+  test("custom regex organizations do not seed coreference", async () => {
+    const entities = await detect(
+      'Acme Incorporated (hereinafter "Acme") later paid Acme.',
+      {
+        enableRegex: true,
+        enableCoreference: true,
+        customRegexes: [
+          {
+            pattern: "Acme Incorporated",
+            label: "organization",
+            score: 1,
+          },
+        ],
+        labels: ["organization"],
+      },
+    );
+
+    expect(entities).toEqual([
+      expect.objectContaining({
+        label: "organization",
+        text: "Acme Incorporated",
+        source: "regex",
+        sourceDetail: "custom-regex",
+      }),
+    ]);
+  });
+
+  test("custom regex phone numbers bypass built-in length gates", async () => {
+    const entities = await detect("Internal extension 1234 is listed.", {
+      enableRegex: true,
+      customRegexes: [
+        {
+          pattern: "\\b\\d{4}\\b",
+          label: "phone number",
+          score: 1,
+        },
+      ],
+      labels: ["phone number"],
+    });
+
+    expect(entities).toEqual([
+      expect.objectContaining({
+        label: "phone number",
+        text: "1234",
+        source: "regex",
+        sourceDetail: "custom-regex",
+      }),
+    ]);
+  });
+
+  test("custom regexes preserve caller-owned false-positive-looking matches", async () => {
+    const entities = await detect("Matter AB is referenced.", {
+      enableRegex: true,
+      customRegexes: [
+        {
+          pattern: "\\bAB\\b",
+          label: "registration number",
+          score: 1,
+        },
+      ],
+      labels: ["registration number"],
+    });
+    expect(entities).toEqual([
+      expect.objectContaining({
+        label: "registration number",
+        text: "AB",
+        source: "regex",
+        sourceDetail: "custom-regex",
+      }),
+    ]);
+  });
+
+  test("label-filtered custom regexes do not mask requested NER labels", async () => {
+    const fullText = "John met Alice.";
+    const entities = await runPipeline({
+      fullText,
+      config: {
+        ...BASE_CONFIG,
+        enableRegex: true,
+        enableNer: true,
+        customRegexes: [
+          {
+            pattern: "John",
+            label: "code",
+          },
+        ],
+        labels: ["person"],
+      },
+      gazetteerEntries: [],
+      context: createPipelineContext(),
+      nerInference: async (maskedText) => {
+        expect(maskedText).toBe(fullText);
+        return [
+          {
+            start: 0,
+            end: 4,
+            label: "person",
+            text: "John",
+            score: 0.95,
+            source: "ner",
+          },
+        ];
+      },
+    });
+
+    expect(entities).toEqual([
+      expect.objectContaining({
+        label: "person",
+        text: "John",
+        source: "ner",
+      }),
+    ]);
+  });
+
   test("hotword reclassification can promote filtered source labels into requested output labels", async () => {
     const entities = await detect("narozen dne 12.03.1990 v Praze", {
       enableRegex: true,

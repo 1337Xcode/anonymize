@@ -61,9 +61,22 @@ const LITERAL_SOURCES: ReadonlySet<string> = new Set([
   "gazetteer",
 ]);
 
+const isCallerOwnedEntity = (entity: Entity): boolean =>
+  entity.sourceDetail === "custom-deny-list" ||
+  entity.sourceDetail === "custom-regex";
+
+const hasLockedBoundary = (entity: Entity): boolean =>
+  isCallerOwnedEntity(entity);
+
 const shouldReplace = (a: Entity, b: Entity): boolean => {
   const aLen = a.end - a.start;
   const bLen = b.end - b.start;
+  const aCallerOwned = isCallerOwnedEntity(a);
+  const bCallerOwned = isCallerOwnedEntity(b);
+  if (aCallerOwned !== bCallerOwned) {
+    return aCallerOwned;
+  }
+
   // Containment: when a literal-match entity (deny-list
   // or gazetteer) fully contains a shorter entity with
   // the same label, prefer the longer one. Curated
@@ -103,6 +116,10 @@ const COLON_LABELS = new Set(["ip address", "mac address"]);
 /** Strip leading/trailing whitespace and punctuation. */
 export const sanitizeEntities = (entities: Entity[]): Entity[] =>
   entities.flatMap((e) => {
+    if (hasLockedBoundary(e)) {
+      return [e];
+    }
+
     const strip = COLON_LABELS.has(e.label) ? /[\s,;]+/ : /[\s:,;]+/;
     // Also strip leading dots followed by whitespace —
     // artifact from trigger extraction after abbreviations
@@ -159,11 +176,44 @@ export const mergeAndDedup = (...layers: Entity[][]): Entity[] => {
     if (last.end <= entity.start) {
       // No overlap: append.
       merged.push({ ...entity });
-    } else if (shouldReplace(entity, last)) {
-      // Overlap: new entity wins.
-      merged[merged.length - 1] = { ...entity };
+      continue;
     }
-    // else: overlap but existing wins; discard entity.
+
+    const overlapStart = (() => {
+      for (let j = merged.length - 1; j >= 0; j--) {
+        const existing = merged[j];
+        if (!existing || existing.end <= entity.start) {
+          return j + 1;
+        }
+      }
+      return 0;
+    })();
+    const overlaps = merged.slice(overlapStart);
+    const hasPartialOverlap = overlaps.some(
+      (existing) =>
+        existing.start !== entity.start || existing.end !== entity.end,
+    );
+
+    if (!hasPartialOverlap) {
+      const sameLabelIndex = overlaps.findIndex(
+        (existing) => existing.label === entity.label,
+      );
+      if (sameLabelIndex === -1) {
+        merged.push({ ...entity });
+        continue;
+      }
+
+      const actualIndex = overlapStart + sameLabelIndex;
+      const sameLabel = merged[actualIndex];
+      if (sameLabel && shouldReplace(entity, sameLabel)) {
+        merged[actualIndex] = { ...entity };
+      }
+      continue;
+    }
+
+    if (overlaps.every((existing) => shouldReplace(entity, existing))) {
+      merged.splice(overlapStart, overlaps.length, { ...entity });
+    }
   }
 
   return sanitizeEntities(merged);
@@ -223,7 +273,9 @@ const extendMonetaryAmountWords = (
   re: RegExp,
 ): Entity[] =>
   entities.map((e) => {
-    if (e.label !== "monetary amount") return e;
+    if (e.label !== "monetary amount" || isCallerOwnedEntity(e)) {
+      return e;
+    }
     const after = fullText.slice(e.end);
     const m = re.exec(after);
     if (!m) return e;
@@ -243,6 +295,8 @@ const createAllowedLabelSetFromLabels = (
 
 const createAllowedLabelSet = (config: PipelineConfig): AllowedLabelSet =>
   createAllowedLabelSetFromLabels(config.labels);
+
+const DEFAULT_CUSTOM_REGEX_SCORE = 0.9;
 
 const filterAllowedLabels = (
   entities: Entity[],
@@ -279,6 +333,32 @@ const configKey = (
   gazetteerEntries: GazetteerEntry[],
 ): string => {
   const legalFormsEnabled = isLegalFormsEnabled(config);
+  const customDenyFingerprint =
+    config.enableDenyList && config.customDenyList
+      ? config.customDenyList
+          .map((entry) =>
+            JSON.stringify({
+              label: entry.label,
+              value: entry.value,
+              variants: [...(entry.variants ?? [])].sort(),
+            }),
+          )
+          .sort()
+          .join("\n")
+      : "";
+  const customRegexFingerprint =
+    config.enableRegex && config.customRegexes
+      ? config.customRegexes
+          .map((entry) =>
+            JSON.stringify({
+              label: entry.label,
+              pattern: entry.pattern,
+              score: entry.score ?? DEFAULT_CUSTOM_REGEX_SCORE,
+            }),
+          )
+          .sort()
+          .join("\n")
+      : "";
   // Gazetteer fingerprint: sorted entry IDs,
   // canonical forms, labels, and variants.
   // Skip when gazetteer is disabled to avoid
@@ -298,9 +378,12 @@ const configKey = (
     `${config.enableTriggerPhrases}:` +
     `${legalFormsEnabled}:` +
     `${config.enableNameCorpus}:` +
+    `${config.enableRegex}:` +
     `${config.denyListCountries?.toSorted().join(",") ?? ""}:` +
     `${config.denyListRegions?.toSorted().join(",") ?? ""}:` +
     `${config.denyListExcludeCategories?.toSorted().join(",") ?? ""}:` +
+    `${customDenyFingerprint}:` +
+    `${customRegexFingerprint}:` +
     `${config.enableGazetteer}:${gazFingerprint}`
   );
 };
@@ -469,7 +552,10 @@ export const runPipeline = async (
   checkAbort(signal);
 
   // Two-pass scan (regex + literals)
-  const { regexMatches, literalMatches } = runUnifiedSearch(search, fullText);
+  const { regexMatches, customRegexMatches, literalMatches } = runUnifiedSearch(
+    search,
+    fullText,
+  );
   const { slices } = search;
 
   const rawRegexEntities = config.enableRegex
@@ -480,8 +566,20 @@ export const runPipeline = async (
         search.regexMeta,
       )
     : [];
+  const rawCustomRegexEntities = config.enableRegex
+    ? processRegexMatches(
+        customRegexMatches,
+        slices.customRegex.start,
+        slices.customRegex.end,
+        search.customRegexMeta,
+      )
+    : [];
+  const customRegexEntities = filterAllowedLabels(
+    rawCustomRegexEntities,
+    preHotwordAllowedLabels,
+  );
   const regexEntities = filterAllowedLabels(
-    rawRegexEntities,
+    [...rawRegexEntities, ...customRegexEntities],
     preHotwordAllowedLabels,
   );
   if (regexEntities.length > 0) log("regex", `${regexEntities.length} matches`);
@@ -570,12 +668,35 @@ export const runPipeline = async (
 
   checkAbort(signal);
 
+  const rawCustomDenyListEntities = rawDenyListEntities.filter((entity) =>
+    isCallerOwnedEntity(entity),
+  );
+  const rawCuratedDenyListEntities = rawDenyListEntities.filter(
+    (entity) => !isCallerOwnedEntity(entity),
+  );
+  const customDenyListEntities = filterAllowedLabels(
+    rawCustomDenyListEntities,
+    preHotwordAllowedLabels,
+  );
+
   const ruleContextEntities = [
     ...rawTriggerEntities,
     ...rawRegexEntities,
+    ...customRegexEntities,
     ...rawLegalFormEntities,
     ...rawNameCorpusEntities,
-    ...rawDenyListEntities,
+    ...rawCuratedDenyListEntities,
+    ...customDenyListEntities,
+    ...rawGazetteerEntities,
+  ];
+  const nerMaskEntities = [
+    ...rawTriggerEntities,
+    ...rawRegexEntities,
+    ...customRegexEntities,
+    ...rawLegalFormEntities,
+    ...rawNameCorpusEntities,
+    ...rawCuratedDenyListEntities,
+    ...customDenyListEntities,
     ...rawGazetteerEntities,
   ];
 
@@ -584,7 +705,7 @@ export const runPipeline = async (
   let rawNerEntities: Entity[] = [];
   let nerEntities: Entity[] = [];
   if (config.enableNer && nerInference) {
-    const maskResult = maskDetectedSpans(fullText, ruleContextEntities);
+    const maskResult = maskDetectedSpans(fullText, nerMaskEntities);
     log("ner", "running inference...");
     const rawNer = await nerInference(
       maskResult.maskedText,
@@ -641,12 +762,22 @@ export const runPipeline = async (
   // Hotword context rules: boost or reclassify
   // entities near relevant keywords. Applied after
   // zone adjustments so both effects stack.
-  const preBoostEntities = hotwordsActive
-    ? filterAllowedLabels(
-        applyHotwordRules(zoneAdjusted, fullText),
+  const preBoostEntities = (() => {
+    if (!hotwordsActive) {
+      return zoneAdjusted;
+    }
+    const hotwordCandidates = zoneAdjusted.filter(
+      (entity) => !isCallerOwnedEntity(entity),
+    );
+    const callerOwnedEntities = zoneAdjusted.filter(isCallerOwnedEntity);
+    return [
+      ...filterAllowedLabels(
+        applyHotwordRules(hotwordCandidates, fullText),
         allowedLabels,
-      )
-    : zoneAdjusted;
+      ),
+      ...callerOwnedEntities,
+    ];
+  })();
 
   // Confidence boost + threshold filter
   let allEntities: Entity[];
@@ -740,7 +871,10 @@ export const runPipeline = async (
   // context doesn't leak sourceText across documents.
   ctx.corefSourceMap.clear();
   if (config.enableCoreference) {
-    const terms = await extractDefinedTerms(fullText, merged, ctx);
+    const coreferenceSeeds = merged.filter(
+      (entity) => !isCallerOwnedEntity(entity),
+    );
+    const terms = await extractDefinedTerms(fullText, coreferenceSeeds, ctx);
     if (terms.length > 0) {
       log("coreference", `${terms.length} defined terms`);
       const corefSpans = findCoreferenceSpans(fullText, terms, ctx);
