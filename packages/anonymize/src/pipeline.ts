@@ -117,6 +117,104 @@ const shouldReplace = (a: Entity, b: Entity): boolean => {
 /** Labels where colons are structurally significant. */
 const COLON_LABELS = new Set(["ip address", "mac address"]);
 
+/**
+ * Labels whose detectors emit precise, evidence-backed spans. When
+ * one of these fires at the exact same offsets as a fuzzier
+ * `address` hit (city dictionary lookup, address-seed cluster), the
+ * `address` label is almost always a dictionary collision — "March
+ * 15" the date getting tagged as an address because "March" appears
+ * in a city corpus, or "Brent Phillips" emitted as both `person`
+ * and `address` because "Brent" is a UK city. The precise detector
+ * wins.
+ */
+const PRECISE_OVER_ADDRESS: ReadonlySet<string> = new Set([
+  "person",
+  "date",
+  "date of birth",
+  "phone number",
+  "email address",
+  "monetary amount",
+  "iban",
+  "bank account number",
+  "tax identification number",
+  "registration number",
+  "identity card number",
+  "passport number",
+  "credit card number",
+]);
+
+/**
+ * Labels the `person` chain wins against at identical offsets. The
+ * chain carries adjacent-name evidence (deny-list surname plus a
+ * capitalised follow-up) a single-token dictionary collision does
+ * not. Kept narrow: organizations are NOT here — "Morgan Stanley"
+ * legitimately appears in both the org and name dictionaries, and
+ * the existing detector priority is the right tie-breaker there.
+ */
+const PERSON_PREFERRED_OVER: ReadonlySet<string> = new Set([
+  "address",
+  "land parcel",
+]);
+
+const resolveSameSpanLabelConflicts = (entities: Entity[]): Entity[] => {
+  if (entities.length < 2) return entities;
+  const byOffsets = new Map<string, Entity[]>();
+  for (const entity of entities) {
+    const key = `${entity.start}:${entity.end}`;
+    const list = byOffsets.get(key);
+    if (list) {
+      list.push(entity);
+    } else {
+      byOffsets.set(key, [entity]);
+    }
+  }
+  const dropped = new Set<Entity>();
+  for (const [, group] of byOffsets) {
+    if (group.length < 2) continue;
+    const labels = new Set(group.map((e) => e.label));
+    if (labels.size < 2) continue;
+
+    const hasPerson = labels.has("person");
+    const hasPreciseNonAddress = [...labels].some(
+      (l) => l !== "address" && PRECISE_OVER_ADDRESS.has(l),
+    );
+
+    // When entities at the same offsets have different labels,
+    // also let detector priority break ties: a `legal-form`
+    // organization hit (priority 3) should keep its label over a
+    // coincident `deny-list` person hit (priority 2). Compute the
+    // max priority once so we can drop strictly-lower-priority
+    // duplicates regardless of label.
+    let maxPriority = -1;
+    for (const e of group) {
+      if (hasLockedBoundary(e)) continue;
+      const pri = DETECTOR_PRIORITY[e.source] ?? 0;
+      if (pri > maxPriority) maxPriority = pri;
+    }
+
+    for (const e of group) {
+      // Caller-owned spans (custom deny-list / custom regex) carry
+      // explicit user intent; never drop them in favour of a
+      // detector-generated label.
+      if (hasLockedBoundary(e)) continue;
+      const pri = DETECTOR_PRIORITY[e.source] ?? 0;
+      if (pri < maxPriority) {
+        dropped.add(e);
+        continue;
+      }
+      if (hasPerson && PERSON_PREFERRED_OVER.has(e.label)) {
+        dropped.add(e);
+        continue;
+      }
+      if (hasPreciseNonAddress && e.label === "address") {
+        dropped.add(e);
+      }
+    }
+  }
+  if (dropped.size === 0) return entities;
+  return entities.filter((e) => !dropped.has(e));
+};
+
 /** Strip leading/trailing whitespace and punctuation. */
 export const sanitizeEntities = (entities: Entity[]): Entity[] =>
   entities.flatMap((e) => {
@@ -244,7 +342,7 @@ export const mergeAndDedup = (...layers: Entity[][]): Entity[] => {
     }
   }
 
-  return sanitizeEntities(merged);
+  return resolveSameSpanLabelConflicts(sanitizeEntities(merged));
 };
 
 export type NerInferenceFn = (
