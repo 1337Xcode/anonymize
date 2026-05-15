@@ -17,6 +17,8 @@ import type { Match } from "@stll/text-search";
 import { DETECTION_SOURCES } from "../types";
 import type { Entity } from "../types";
 import {
+  DASH,
+  DASH_INNER,
   OPENING_BRACKETS_INNER,
   QUOTE_DOUBLE_INNER,
   QUOTE_SINGLE_INNER,
@@ -34,6 +36,28 @@ const ADDRESS_TRAILING_TRIM_RE = new RegExp(
   `[,;:\\s${OPENING_BRACKETS_INNER}${QUOTE_DOUBLE_INNER}${QUOTE_SINGLE_INNER}′]`,
   "u",
 );
+const POSTAL_ADJACENT = `\\p{L}\\p{N}_${DASH_INNER}`;
+const POSTAL_CODE_RE = new RegExp(
+  `(?<![${POSTAL_ADJACENT}])` +
+    `(?:\\d{3}\\s\\d{2}|\\d{2}${DASH}\\d{3}|\\d{5}${DASH}\\d{3}|\\d{5}${DASH}\\d{4})` +
+    `(?![${POSTAL_ADJACENT}])`,
+  "gu",
+);
+const BR_CEP_SHAPE_RE = new RegExp(`^\\d{5}${DASH}\\d{3}$`, "u");
+const US_ZIP_PLUS_FOUR_SHAPE_RE = new RegExp(`^\\d{5}${DASH}\\d{4}$`, "u");
+const US_STATE_ABBREV =
+  "A[KLRZ]|C[AOT]|D[CE]|F[LM]|G[AU]|HI|I[ADLN]|K[SY]|LA|" +
+  "M[ADEHINOPST]|N[CDEHJMVY]|O[HKR]|P[AR]|RI|S[CD]|T[NX]|" +
+  "UT|V[AIT]|W[AIVY]";
+const US_STATE_ABBREV_BEFORE_ZIP_RE = new RegExp(
+  `(?:^|[^A-Za-z0-9])(${US_STATE_ABBREV})\\s*,?\\s*$`,
+  "u",
+);
+const US_ZIP_CONTEXT_WINDOW = 120;
+const US_CITY_ZIP_GAP_RE = /^[\s,]+$/u;
+const HOUSE_NUMBER_BEFORE_STREET_RE =
+  /\b\d{1,6}(?:[-/]\d{1,6})?\s+(?:\p{Lu}\p{L}+[^\S\n\t]+){0,4}$/u;
+const HOUSE_NUMBER_AFTER_STREET_RE = /^[^\S\n\t]+\d{1,6}(?:[-/]\d{1,6})?\b/u;
 
 // ── Seed types ──────────────────────────────────────
 
@@ -42,6 +66,7 @@ type SeedType =
   | "house-number"
   | "postal-code"
   | "city"
+  | "state"
   | "address-trigger";
 
 type Seed = {
@@ -156,6 +181,82 @@ const hasBrCueNearby = (
   // would carry lastIndex across calls.
   const probe = new RegExp(re.source, re.flags.replace("g", ""));
   return probe.test(window);
+};
+
+type UsZipPlusFourContext = {
+  stateSeed: Seed | null;
+  hasContext: boolean;
+};
+
+const getUsStateSeedBeforeZip = (
+  fullText: string,
+  start: number,
+): Seed | null => {
+  const stateWindowStart = Math.max(0, start - 24);
+  const stateWindow = fullText.slice(stateWindowStart, start);
+  const match = US_STATE_ABBREV_BEFORE_ZIP_RE.exec(stateWindow);
+  const state = match?.[1];
+  if (!match || !state) {
+    return null;
+  }
+
+  const stateOffset = match[0].indexOf(state);
+  const stateStart = stateWindowStart + match.index + stateOffset;
+  return {
+    type: "state",
+    start: stateStart,
+    end: stateStart + state.length,
+    text: state,
+  };
+};
+
+const hasHouseNumberNearStreetWord = (
+  fullText: string,
+  seed: Seed,
+): boolean => {
+  if (/\d/.test(seed.text)) {
+    return true;
+  }
+
+  const before = fullText.slice(Math.max(0, seed.start - 50), seed.start);
+  if (HOUSE_NUMBER_BEFORE_STREET_RE.test(before)) {
+    return true;
+  }
+
+  const after = fullText.slice(
+    seed.end,
+    Math.min(fullText.length, seed.end + 24),
+  );
+  return HOUSE_NUMBER_AFTER_STREET_RE.test(after);
+};
+
+const getUsZipPlusFourContext = (
+  fullText: string,
+  start: number,
+  seeds: readonly Seed[],
+): UsZipPlusFourContext => {
+  const stateSeed = getUsStateSeedBeforeZip(fullText, start);
+  if (stateSeed !== null) {
+    return { stateSeed, hasContext: true };
+  }
+
+  const hasContext = seeds.some((seed) => {
+    if (Math.abs(seed.start - start) > US_ZIP_CONTEXT_WINDOW) {
+      return false;
+    }
+    if (seed.type === "address-trigger") {
+      return true;
+    }
+    if (seed.type === "city" && seed.end <= start) {
+      const gap = fullText.slice(seed.end, start);
+      return US_CITY_ZIP_GAP_RE.test(gap);
+    }
+    if (seed.type === "street-word") {
+      return hasHouseNumberNearStreetWord(fullText, seed);
+    }
+    return false;
+  });
+  return { stateSeed: null, hasContext };
 };
 
 /**
@@ -288,14 +389,18 @@ const collectSeeds = (
   //   Czech/Slovak: NNN NN (e.g., 140 00)
   //   Polish: NN-NNN (e.g., 00-950)
   //   Brazilian CEP: NNNNN-NNN (e.g., 01001-000)
+  //   US ZIP+4: NNNNN-NNNN (e.g., 94304-1050)
   // The CEP shape collides with bare order/ticket numbers
   // ("Order 12345-678"), and the cluster's other seed
   // could be a non-BR deny-list city. To prevent that, the
   // CEP-shaped seed is only kept when a pt-BR cue word
   // (rua/avenida/CNPJ/CPF/RG/…) appears within the cluster
   // window around it. The Czech/Slovak and Polish shapes
-  // are distinctive enough not to need a similar gate.
-  const postalRe = /\b(?:\d{3}\s\d{2}|\d{2}-\d{3}|\d{5}-\d{3})\b/g;
+  // are distinctive enough not to need a similar gate. US
+  // ZIP+4 seeds are only kept with nearby address evidence
+  // because business/order IDs often share the same shape.
+  const postalRe = POSTAL_CODE_RE;
+  postalRe.lastIndex = 0;
   let postalMatch;
   while ((postalMatch = postalRe.exec(fullText)) !== null) {
     const start = postalMatch.index;
@@ -304,13 +409,30 @@ const collectSeeds = (
     if (alreadyCovered) {
       continue;
     }
-    const isCepShape = /^\d{5}-\d{3}$/.test(postalMatch[0]);
+    const isCepShape = BR_CEP_SHAPE_RE.test(postalMatch[0]);
     if (
       isCepShape &&
       (brCepContextRe === null ||
         !hasBrCueNearby(fullText, start, end, brCepContextRe))
     ) {
       continue;
+    }
+    const isUsZipPlusFourShape = US_ZIP_PLUS_FOUR_SHAPE_RE.test(postalMatch[0]);
+    if (isUsZipPlusFourShape) {
+      const usContext = getUsZipPlusFourContext(fullText, start, seeds);
+      if (!usContext.hasContext) {
+        continue;
+      }
+      const stateSeed = usContext.stateSeed;
+      if (stateSeed !== null) {
+        const hasStateSeed = seeds.some(
+          (seed) =>
+            seed.start === stateSeed.start && seed.end === stateSeed.end,
+        );
+        if (!hasStateSeed) {
+          seeds.push(stateSeed);
+        }
+      }
     }
     seeds.push({
       type: "postal-code",
@@ -445,6 +567,7 @@ const scoreCluster = (cluster: SeedCluster): number => {
 
   if (types.has("postal-code")) score += 0.15;
   if (types.has("city")) score += 0.15;
+  if (types.has("state")) score += 0.15;
   if (types.has("street-word")) score += 0.15;
   if (types.has("address-trigger")) score += 0.1;
 
