@@ -230,6 +230,11 @@ const hasHouseNumberNearStreetWord = (
   return HOUSE_NUMBER_AFTER_STREET_RE.test(after);
 };
 
+const isLowercaseStreetWordInProse = (fullText: string, seed: Seed): boolean =>
+  /^\p{Ll}/u.test(seed.text) &&
+  /^\s+\p{Ll}/u.test(fullText.slice(seed.end, seed.end + 16)) &&
+  !hasHouseNumberNearStreetWord(fullText, seed);
+
 const getUsZipPlusFourContext = (
   fullText: string,
   start: number,
@@ -345,12 +350,16 @@ const collectSeeds = (
     if (idx < sliceStart || idx >= sliceEnd) {
       continue;
     }
-    seeds.push({
+    const seed = {
       type: "street-word",
       start: match.start,
       end: match.end,
       text: match.text,
-    });
+    } satisfies Seed;
+    if (isLowercaseStreetWordInProse(fullText, seed)) {
+      continue;
+    }
+    seeds.push(seed);
   }
 
   // 2. Cities and postal codes from existing entities
@@ -597,6 +606,7 @@ const expandCluster = async (
   existingEntities: Entity[],
 ): Promise<{ start: number; end: number }> => {
   const { start, end } = cluster;
+  const seedTypes = new Set(cluster.seeds.map((seed) => seed.type));
 
   // Find the nearest non-address entity to the LEFT
   let leftBound = 0;
@@ -635,6 +645,19 @@ const expandCluster = async (
     }
 
     leftPos = p + 1;
+  }
+
+  const hasExpandableAddressContext =
+    seedTypes.has("street-word") ||
+    seedTypes.has("house-number") ||
+    seedTypes.has("postal-code") ||
+    seedTypes.has("address-trigger");
+
+  if (!hasExpandableAddressContext) {
+    return {
+      start: Math.min(leftPos, start),
+      end,
+    };
   }
 
   // Expand right: include following text until we

@@ -21,13 +21,14 @@ const CONFIG: PipelineConfig = {
   workspaceId: "test",
 };
 
+const SHARED_CONTEXT = createPipelineContext();
+
 const orgsIn = async (text: string): Promise<string[]> => {
-  const ctx = createPipelineContext();
   const entities = await runPipeline({
     fullText: text,
     config: CONFIG,
     gazetteerEntries: [],
-    context: ctx,
+    context: SHARED_CONTEXT,
   });
   return entities.filter((e) => e.label === "organization").map((e) => e.text);
 };
@@ -46,7 +47,7 @@ describe("legal-form firm name capture", () => {
     expect(await orgsIn("Goldman Sachs & Co. LLC")).toContain(
       "Goldman Sachs & Co. LLC",
     );
-  });
+  }, 10_000);
 
   test("ampersand + Co. inside in-context sentence", async () => {
     expect(

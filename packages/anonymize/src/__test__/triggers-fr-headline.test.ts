@@ -1,8 +1,9 @@
-import { describe, expect, test } from "bun:test";
+import { beforeAll, describe, expect, test } from "bun:test";
 
 import {
   createPipelineContext,
   DEFAULT_ENTITY_LABELS,
+  preparePipelineSearch,
   runPipeline,
 } from "../index";
 import type { Dictionaries, PipelineConfig } from "../types";
@@ -50,6 +51,15 @@ const runFr = async (text: string) => {
 };
 
 describe("French headline-style trigger regressions", () => {
+  beforeAll(async () => {
+    const dictionaries = await getDictionaries();
+    await preparePipelineSearch({
+      config: { ...CONFIG, dictionaries },
+      gazetteerEntries: [],
+      context: getCtx(),
+    });
+  });
+
   test("phone trigger does not steal a following SIREN value", async () => {
     const text = "Téléphone : non communiqué SIREN : 123456789";
     const ents = await runFr(text);

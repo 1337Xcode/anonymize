@@ -249,6 +249,26 @@ describe("contract quality regressions", () => {
     ).toBe(false);
   });
 
+  test("city-state address seeds do not absorb following prose", async () => {
+    const entities = await detect(
+      "Any arbitration shall take place in Norfolk, Virginia, and shall be administered by the American Arbitration Association.",
+    );
+
+    expect(
+      entities.some(
+        (entity) =>
+          entity.label === "address" &&
+          entity.text.includes("shall be administered"),
+      ),
+    ).toBe(false);
+    expect(
+      entities.some(
+        (entity) =>
+          entity.label === "address" && entity.text === "Norfolk, Virginia",
+      ),
+    ).toBe(true);
+  });
+
   test("rejects all-caps document headings as organizations", async () => {
     const entities = await detect(
       "THIS AMENDMENT NO. 1 TO AMENDED AND RESTATED EMPLOYMENT AGREEMENT",

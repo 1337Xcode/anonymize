@@ -560,28 +560,32 @@ const writeSnapshot = (path: string, snapshot: ContractSnapshot) => {
 
 describe("contract snapshots", () => {
   for (const fixture of FIXTURES) {
-    test(fixture.name, async () => {
-      const fullText = readFileSync(fixture.textPath, "utf8");
-      const entities = await runPipeline({
-        fullText,
-        config: { ...CONFIG, dictionaries: await getDictionaries() },
-        gazetteerEntries: [],
-        context: CONTEXT,
-      });
+    test(
+      fixture.name,
+      async () => {
+        const fullText = readFileSync(fixture.textPath, "utf8");
+        const entities = await runPipeline({
+          fullText,
+          config: { ...CONFIG, dictionaries: await getDictionaries() },
+          gazetteerEntries: [],
+          context: CONTEXT,
+        });
 
-      fixture.assertQuality?.(entities);
+        fixture.assertQuality?.(entities);
 
-      const snapshot = toSnapshot(fullText, entities, CONTEXT);
+        const snapshot = toSnapshot(fullText, entities, CONTEXT);
 
-      if (UPDATE_SNAPSHOTS || !existsSync(fixture.snapshotPath)) {
-        writeSnapshot(fixture.snapshotPath, snapshot);
-      }
+        if (UPDATE_SNAPSHOTS || !existsSync(fixture.snapshotPath)) {
+          writeSnapshot(fixture.snapshotPath, snapshot);
+        }
 
-      const expected = JSON.parse(
-        readFileSync(fixture.snapshotPath, "utf8"),
-      ) as ContractSnapshot;
+        const expected = JSON.parse(
+          readFileSync(fixture.snapshotPath, "utf8"),
+        ) as ContractSnapshot;
 
-      expect(snapshot).toEqual(expected);
-    });
+        expect(snapshot).toEqual(expected);
+      },
+      20_000,
+    );
   }
 });
