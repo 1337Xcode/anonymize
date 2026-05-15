@@ -107,14 +107,28 @@ export const loadTestDictionaries = async (): Promise<Dictionaries> => {
     "SK",
     "US",
   ];
-  const cities = await dataModule.loadCityDictionaries(CITY_COUNTRIES);
+  const cityResults = await Promise.all(
+    CITY_COUNTRIES.map(async (country) => ({
+      country,
+      entries: await dataModule.loadCityDictionary(country),
+    })),
+  );
+  const citiesByCountry: Record<string, readonly string[]> = {};
+  const mergedCities: string[] = [];
+  for (const { country, entries } of cityResults) {
+    citiesByCountry[country] = entries;
+    for (const entry of entries) {
+      mergedCities.push(entry);
+    }
+  }
 
   const result: Dictionaries = {
     firstNames,
     surnames,
     denyList,
     denyListMeta,
-    cities,
+    cities: mergedCities,
+    citiesByCountry,
   };
 
   cached = result;

@@ -18,6 +18,9 @@ import {
   DEFAULT_ENTITY_LABELS,
   runPipeline,
 } from "../index";
+import addressStopwordsData from "../data/address-stopwords.json";
+import commonWordsData from "../data/common-words-en.json";
+import { buildDenyList } from "../detectors/deny-list";
 import type { Entity, PipelineConfig } from "../types";
 import type { PipelineContext } from "../context";
 import { loadTestDictionaries } from "./load-dictionaries";
@@ -61,7 +64,109 @@ const detect = async (fullText: string): Promise<Entity[]> => {
   });
 };
 
+const SINGLE_WORD_RE = /^\p{L}+$/u;
+const commonWords = new Set(
+  commonWordsData.words.map((word) => word.toLowerCase()),
+);
+
+const toTitleCase = (word: string): string =>
+  word.slice(0, 1).toUpperCase() + word.slice(1).toLowerCase();
+
 describe("deny-list curation", () => {
+  test("curated common-word patterns are dropped before automaton build", async () => {
+    const dictionaries = await getDictionaries();
+    const data = await buildDenyList(
+      { ...baseConfig, dictionaries },
+      getContext(),
+    );
+    expect(data).not.toBeNull();
+    if (!data) return;
+
+    const leaked: string[] = [];
+    for (const [index, original] of data.originals.entries()) {
+      if (!SINGLE_WORD_RE.test(original)) continue;
+      if (!commonWords.has(original.toLowerCase())) continue;
+
+      const labels = data.labels[index] ?? [];
+      if (labels.length === 0 || labels.every((label) => label === "address")) {
+        continue;
+      }
+
+      const sources = data.sources[index] ?? [];
+      const hasCuratedSource = sources.some(
+        (source) => source === "deny-list" || source === "surname",
+      );
+      if (!hasCuratedSource) continue;
+
+      leaked.push(`${original}: ${labels.join(",")} (${sources.join(",")})`);
+    }
+
+    expect(leaked.slice(0, 20)).toEqual([]);
+  });
+
+  test("country-scoped city dictionaries shrink the deny-list pattern set", async () => {
+    const dictionaries = await getDictionaries();
+    const full = await buildDenyList(
+      { ...baseConfig, dictionaries },
+      createPipelineContext(),
+    );
+    const scoped = await buildDenyList(
+      {
+        ...baseConfig,
+        dictionaries,
+        denyListCountries: ["US"],
+        nameCorpusLanguages: ["en"],
+      },
+      createPipelineContext(),
+    );
+
+    expect(full).not.toBeNull();
+    expect(scoped).not.toBeNull();
+    if (!full || !scoped) return;
+
+    expect(scoped.originals.length).toBeLessThan(full.originals.length / 2);
+    expect(scoped.originals).toContain("New York City");
+    const grazCityIndex = scoped.originals.findIndex(
+      (entry, index) =>
+        entry === "Graz" && scoped.sources[index]?.includes("city"),
+    );
+    expect(grazCityIndex).toBe(-1);
+  });
+
+  test("address collision dictionary suppresses bare city-name legal terms", async () => {
+    const dictionaries = await getDictionaries();
+    const cityWords = new Set(
+      (dictionaries.cities ?? []).map((city) => city.toLowerCase()),
+    );
+    const collisionWords = addressStopwordsData.words
+      .filter((word) => cityWords.has(word))
+      .slice(0, 24);
+    expect(collisionWords.length).toBeGreaterThan(8);
+
+    const text = collisionWords
+      .map((word) => `${toTitleCase(word)} required.`)
+      .join(" ");
+    const entities = await detect(text);
+    const leakedAddresses = entities
+      .filter((entity) => entity.label === "address")
+      .map((entity) => entity.text.toLowerCase())
+      .filter((text) => collisionWords.includes(text));
+
+    expect(leakedAddresses).toEqual([]);
+  });
+
+  test("real city mentions are not globally suppressed as common words", async () => {
+    // `Vienna` is present in common-words-en because that
+    // file includes high-frequency proper nouns. Address
+    // suppression must therefore use the narrower
+    // address-collision dictionary, not every common word.
+    const entities = await detect("The meeting is in Vienna.");
+    const vienna = entities.find(
+      (entity) => entity.label === "address" && entity.text === "Vienna",
+    );
+    expect(vienna).toBeDefined();
+  });
+
   test("single-token English nouns are not flagged as person", async () => {
     // Each highlighted word case-folds to a name-corpus entry
     // but is a plain English noun in legal prose.
@@ -75,6 +180,35 @@ describe("deny-list curation", () => {
     for (const noun of ["Laws", "Fee", "Letters", "Measures", "Vote"]) {
       expect(personTexts.has(noun)).toBe(false);
     }
+  });
+
+  test("post-money valuation term is not flagged as address", async () => {
+    // `Post` exists as a small-city name in GeoNames.
+    // In legal/finance prose, the hyphenated defined term
+    // `Post-Money Valuation` is not a district-style address.
+    const text =
+      "The Post-Money Valuation Cap is 10.000.000 USD " +
+      "(nine million dollars).";
+    const entities = await detect(text);
+    const addressTexts = new Set(
+      entities.filter((e) => e.label === "address").map((e) => e.text),
+    );
+    expect(addressTexts.has("Post")).toBe(false);
+    expect(addressTexts.has("Post-Money Valuation")).toBe(false);
+  });
+
+  test("creative commons license text is not flagged as person", async () => {
+    // `Commons` is present in name data, but in this
+    // title-case license phrase it is a common noun.
+    const text =
+      "This form is made available under a Creative Commons " +
+      "Attribution-NoDerivatives 4.0 License.";
+    const entities = await detect(text);
+    const personTexts = new Set(
+      entities.filter((e) => e.label === "person").map((e) => e.text),
+    );
+    expect(personTexts.has("Commons")).toBe(false);
+    expect(personTexts.has("Commons Attribution-NoDerivatives")).toBe(false);
   });
 
   test('bare "Bank" is not flagged as organization in defined-term context', async () => {

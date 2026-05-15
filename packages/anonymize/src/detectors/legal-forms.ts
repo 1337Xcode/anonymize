@@ -91,9 +91,85 @@ const SINGLE_CAP = `[${UPPER}](?![${LOWER}${UPPER}])`;
 // All-caps word: 2+ uppercase letters, no lowercase.
 // For company names like "EAGLES BRNO", max 3 words.
 const ALLCAP_WORD = `[${UPPER}]{2,}`;
+// Horizontal whitespace as understood by DOCX text extraction.
+// `regex`/TextSearch does not treat NBSP variants as `\s`, but
+// company names often contain them between words and legal forms.
+const HSPACE = "(?:[^\\S\\n]|[  ])";
+const LEGAL_LIST_BOUNDARY_RE = new RegExp(
+  `^[,;]${HSPACE}+(?=\\p{Lu}|(?:\\p{Lu}\\.${HSPACE}?){2,})`,
+  "u",
+);
 
 const ROMAN_NUMERAL_RE =
   /^(?=[IVXLCDM])M{0,3}(?:CM|CD|D?C{0,3})(?:XC|XL|L?X{0,3})(?:IX|IV|V?I{0,3})$/;
+
+type LeadingClauseTrimConfig = {
+  phrases?: readonly string[];
+  directPrefixes?: readonly string[];
+};
+
+type LeadingClauseTrims = {
+  phrases: readonly string[];
+  directPrefixes: readonly string[];
+};
+
+const EMPTY_LEADING_CLAUSE_TRIMS: LeadingClauseTrims = {
+  phrases: [],
+  directPrefixes: [],
+};
+
+let leadingClauseTrimsCache: LeadingClauseTrims | null = null;
+let leadingClauseTrimsPromise: Promise<LeadingClauseTrims> | null = null;
+
+const loadLeadingClauseTrims = async (): Promise<LeadingClauseTrims> => {
+  if (leadingClauseTrimsCache) return leadingClauseTrimsCache;
+  if (leadingClauseTrimsPromise) return leadingClauseTrimsPromise;
+  leadingClauseTrimsPromise = (async () => {
+    let data: Record<string, unknown> = {};
+    try {
+      const mod = await import("../data/legal-form-leading-clauses.json");
+      const parsed =
+        (mod as { default?: Record<string, unknown> }).default ?? mod;
+      data = parsed as Record<string, unknown>;
+    } catch (err) {
+      console.warn(
+        "[anonymize] legal-forms: failed to load " +
+          "legal-form-leading-clauses.json:",
+        err,
+      );
+    }
+
+    const phrases = new Set<string>();
+    const directPrefixes = new Set<string>();
+    for (const [key, value] of Object.entries(data)) {
+      if (key.startsWith("_") || typeof value !== "object" || value === null) {
+        continue;
+      }
+      const config = value as LeadingClauseTrimConfig;
+      for (const phrase of config.phrases ?? []) {
+        if (typeof phrase === "string" && phrase.length > 0) {
+          phrases.add(phrase);
+        }
+      }
+      for (const prefix of config.directPrefixes ?? []) {
+        if (typeof prefix === "string" && prefix.length > 0) {
+          directPrefixes.add(prefix);
+        }
+      }
+    }
+
+    const result = {
+      phrases: [...phrases],
+      directPrefixes: [...directPrefixes],
+    };
+    leadingClauseTrimsCache = result;
+    return result;
+  })();
+  return leadingClauseTrimsPromise;
+};
+
+const getLeadingClauseTrimsSync = (): LeadingClauseTrims =>
+  leadingClauseTrimsCache ?? EMPTY_LEADING_CLAUSE_TRIMS;
 
 // Generic legal/contract role words that should never appear
 // at the head of an organisation name. When a greedy regex
@@ -156,6 +232,7 @@ export const warmLegalRoleHeads = async (): Promise<void> => {
     loadClauseNounHeads(),
     loadConnectorProseHeads(),
     loadStructuralSingleCapPrefixes(),
+    loadLeadingClauseTrims(),
   ]);
 };
 
@@ -413,11 +490,11 @@ const getStructuralSingleCapPrefixesSync = (): ReadonlySet<string> =>
 const escapeForRegex = (form: string): string =>
   form
     .replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
-    .replace(/\s+/g, "\\s+")
+    .replace(/\s+/g, `${HSPACE}+`)
     // Use [^\S\n]? (optional horizontal whitespace)
     // instead of \s* to prevent greedy matching across
     // newlines which causes DFA failures in regex-set.
-    .replace(/\\\./g, "\\.[^\\S\\n]?");
+    .replace(/\\\./g, `\\.${HSPACE}?`);
 
 const isShortForm = (form: string): boolean =>
   form.replace(/[.\s]/g, "").length <= 3 && !form.includes(" ");
@@ -450,7 +527,6 @@ const buildPatternString = (forms: string[]): string | null => {
   // newlines out of the separators prevents the DFA
   // size from blowing up across line boundaries and
   // matches the existing pattern in escapeForRegex.
-  const HSPACE = "[^\\S\\n]";
   const LOWER_CONNECTOR = `${HSPACE}+(?:a|and|und|et|e|y|i)${HSPACE}+(?=[${LOWER}])`;
   const SIMPLE_SEP = `(?:${HSPACE}|[&,.${DASH_INNER}]){1,4}`;
   // Uppercase- or digit-only word for the strict head.
@@ -501,7 +577,7 @@ const buildPatternString = (forms: string[]): string | null => {
     `${SIMPLE_SEP}(?:${LOWER_WORD})` +
     `(?:(?:${LOWER_CONNECTOR}|${SIMPLE_SEP})(?:${ANY_WORD_TAIL})){0,10}`;
   const prefix = `(?:${head})(?:${tail})?`;
-  const separator = `(?:\\s+|,\\s*)`;
+  const separator = `(?:${HSPACE}+|,${HSPACE}*)`;
 
   return `${prefix}${separator}(?:${alt})(?![${LOWER}])`;
 };
@@ -567,6 +643,44 @@ export const buildLegalFormPatterns = async (): Promise<string[]> => {
   if (shortPattern) {
     patterns.push(shortPattern);
   }
+  const allcapAlt = allForms
+    .toSorted((a, b) => b.length - a.length)
+    .map(escapeForRegex)
+    .join("|");
+  const mixedNameSep = `(?:${HSPACE}|[&,.${DASH_INNER}]){1,4}`;
+
+  const capitalizedNoDigitPrefix =
+    `(?:${CAP_WORD})` +
+    `(?:${mixedNameSep}(?:${CAP_WORD}|${ALLCAP_WORD})){1,8}`;
+  patterns.push(
+    `${capitalizedNoDigitPrefix}(?:${HSPACE}+|,${HSPACE}*)` +
+      `(?:${allcapAlt})(?![${LOWER}])`,
+  );
+
+  // Brand acronyms followed by mixed-case place or product
+  // words: "IKEA Bratislava, s.r.o.". The generic pattern can
+  // over-capture from preceding clause prose before reaching the
+  // suffix; this narrower pattern anchors directly on the acronym
+  // head so the merge step can keep the precise organization span.
+  const allcapMixedPrefix =
+    `(?:${ALLCAP_WORD})` +
+    `(?:${mixedNameSep}(?:${CAP_WORD}|${ALLCAP_WORD}|\\d{1,4})){1,6}`;
+  patterns.push(
+    `${allcapMixedPrefix}(?:${HSPACE}+|,${HSPACE}*)` +
+      `(?:${allcapAlt})(?![${LOWER}])`,
+  );
+
+  // SEC/EDGAR HTML often wraps terminal legal forms onto
+  // the next physical line after a dotted business
+  // designator: "Goldman Sachs & Co.\nLLC". Keep the
+  // newline allowance this narrow so ordinary legal-form
+  // matching still cannot sweep across headings or
+  // paragraph boundaries.
+  const dottedLineWrapPrefix =
+    `(?:${CAP_WORD})` +
+    `(?:${mixedNameSep}(?:${CAP_WORD}|${ALLCAP_WORD})){1,8}` +
+    `\\.${HSPACE}*\\n${HSPACE}*`;
+  patterns.push(`${dottedLineWrapPrefix}(?:${allcapAlt})(?![${LOWER}])`);
 
   // All-caps company names: "EAGLES BRNO, z.s."
   // Up to 3 all-caps words before any legal form.
@@ -581,13 +695,10 @@ export const buildLegalFormPatterns = async (): Promise<string[]> => {
   // the pattern to a single physical line.
   const allcapPrefix =
     `(?:${ALLCAP_WORD})` +
-    `(?:[ \\t&,.${DASH_INNER}]{1,4}(?:${ALLCAP_WORD})){0,2}`;
-  const allcapAlt = allForms
-    .toSorted((a, b) => b.length - a.length)
-    .map(escapeForRegex)
-    .join("|");
+    `(?:(?:${HSPACE}|[&,.${DASH_INNER}]){1,4}(?:${ALLCAP_WORD})){0,2}`;
   patterns.push(
-    `${allcapPrefix}(?:[ \\t]+|,[ \\t]*)` + `(?:${allcapAlt})(?![${LOWER}])`,
+    `${allcapPrefix}(?:${HSPACE}+|,${HSPACE}*)` +
+      `(?:${allcapAlt})(?![${LOWER}])`,
   );
 
   // Single-letter company name immediately followed by a
@@ -600,7 +711,7 @@ export const buildLegalFormPatterns = async (): Promise<string[]> => {
   // "PSČ 466 01\tPS" where a single uppercase letter sits
   // far ahead of the suffix.
   patterns.push(
-    `(?:^|(?<=[^${UPPER}${LOWER}\\p{N}]))[${UPPER}](?:[ \\t]+|,[ \\t]*)` +
+    `(?:^|(?<=[^${UPPER}${LOWER}\\p{N}]))[${UPPER}](?:${HSPACE}+|,${HSPACE}*)` +
       `(?:${allcapAlt})(?![${UPPER}${LOWER}\\p{N}])`,
   );
 
@@ -630,13 +741,12 @@ const COMPANY_SUFFIX_WORDS_RE =
   /^(?:Company|Co|Bank|Brothers|Bros|Sons|Group|Holdings|Trust|Partners|Associates|Corporation|Industries|Enterprises|Solutions|Systems|Services|Foundation|Institute)$/;
 const IN_NAME_PREPOSITION_RE = /^(?:of|the)$/i;
 const ENTITY_HEAD_WORD_RE = /^[\p{L}\p{M}&]+/u;
-const LEADING_CLAUSE_RE = /(?:^|\s)(?:by\s+and\s+between|is\s+between)\s+/giu;
 const BARE_SINGLE_CAP_LEGAL_FORM_RE = new RegExp(
-  `^[${UPPER}](?:[ \\t]+|,[ \\t]*)`,
+  `^[${UPPER}](?:${HSPACE}+|,${HSPACE}*)`,
   "u",
 );
 const STRUCTURAL_SINGLE_CAP_RE = new RegExp(
-  `^([\\p{L}\\p{M}]+)[ \\t]+[${UPPER}](?:[.${DASH_INNER}]?\\d{1,3})?(?:[ \\t]+|,[ \\t]*)`,
+  `^([\\p{L}\\p{M}]+)${HSPACE}+[${UPPER}](?:[.${DASH_INNER}]?\\d{1,3})?(?:${HSPACE}+|,${HSPACE}*)`,
   "u",
 );
 const isStructuralSingleCapMatch = (text: string): boolean => {
@@ -646,6 +756,17 @@ const isStructuralSingleCapMatch = (text: string): boolean => {
     getStructuralSingleCapPrefixesSync().has(first.toLowerCase())
   );
 };
+
+const findLastSuffixSeparator = (text: string): number =>
+  Math.max(
+    text.lastIndexOf(" "),
+    text.lastIndexOf("\t"),
+    text.lastIndexOf(" "),
+    text.lastIndexOf(" "),
+    text.lastIndexOf(","),
+  );
+
+const stripDocxSpaces = (text: string): string => text.replace(/[  ]/g, "");
 
 /**
  * Find the word ending just before `pos` in `text`,
@@ -753,6 +874,91 @@ const trimEmbeddedLegalFormListPrefix = (
     entityStart: entityStart + cut,
     entityText: entityText.slice(cut),
   };
+};
+
+const splitEmbeddedLegalFormList = (
+  entityStart: number,
+  entityText: string,
+): { entityStart: number; entityText: string }[] => {
+  const cuts = [0];
+
+  for (const suffix of getAllLegalSuffixesSync()) {
+    const suffixClean = suffix.replace(/[.,\s]/g, "");
+    if (suffixClean.length > 0 && ROMAN_NUMERAL_RE.test(suffixClean)) {
+      continue;
+    }
+
+    let fromIndex = 0;
+    while (fromIndex < entityText.length) {
+      const suffixStart = entityText.indexOf(suffix, fromIndex);
+      if (suffixStart === -1) {
+        break;
+      }
+      fromIndex = suffixStart + suffix.length;
+
+      const suffixEnd = suffixStart + suffix.length;
+      if (suffixEnd >= entityText.length - 1) {
+        continue;
+      }
+
+      const afterSuffix = entityText.slice(suffixEnd);
+      const boundary = LEGAL_LIST_BOUNDARY_RE.exec(afterSuffix);
+      if (boundary === null) {
+        continue;
+      }
+
+      const nextStart = suffixEnd + boundary[0].length;
+      const remainder = entityText.slice(nextStart);
+      if (!getAllLegalSuffixesSync().some((form) => remainder.endsWith(form))) {
+        continue;
+      }
+
+      cuts.push(nextStart);
+    }
+  }
+
+  const uniqueCuts = [...new Set(cuts)].toSorted((a, b) => a - b);
+  if (uniqueCuts.length === 1) {
+    return [{ entityStart, entityText }];
+  }
+
+  const segments: { entityStart: number; entityText: string }[] = [];
+  for (let index = 0; index < uniqueCuts.length; index++) {
+    const start = uniqueCuts[index];
+    const end = uniqueCuts[index + 1] ?? entityText.length;
+    if (start === undefined) {
+      continue;
+    }
+    const segmentText = entityText.slice(start, end).replace(/[,\s;]+$/u, "");
+    if (segmentText.length === 0) {
+      continue;
+    }
+    segments.push({
+      entityStart: entityStart + start,
+      entityText: segmentText,
+    });
+  }
+
+  return segments;
+};
+
+const hasDisallowedLineBreak = (text: string): boolean => {
+  for (const match of text.matchAll(/\n/gu)) {
+    const index = match.index;
+    if (index === undefined) {
+      continue;
+    }
+    const before = text.slice(0, index);
+    const after = text.slice(index + 1);
+    const dottedDesignatorBefore = /\.[^\S\n]*$/u.test(before);
+    const legalSuffixAfter =
+      /^[^\S\n]*(?:\p{Lu}\.[^\S\n]?){1,}\p{Lu}?\.?$/u.test(after);
+    const allCapsSuffixAfter = /^[^\S\n]*\p{Lu}{2,}\.?$/u.test(after);
+    if (!dottedDesignatorBefore || (!legalSuffixAfter && !allCapsSuffixAfter)) {
+      return true;
+    }
+  }
+  return false;
 };
 
 const hasMiddleInitialBefore = (fullText: string, pos: number): boolean => {
@@ -1035,9 +1241,52 @@ const extendBackward = (
 
 const trimLeadingClause = (text: string): { offset: number; text: string } => {
   let cut = -1;
+  const trims = getLeadingClauseTrimsSync();
+  const phraseAlternation = trims.phrases.map(escapeForRegex).join("|");
+  if (phraseAlternation.length > 0) {
+    const phraseRe = new RegExp(
+      `(?:^|\\s)(?:${phraseAlternation})${HSPACE}+`,
+      "giu",
+    );
+    for (const match of text.matchAll(phraseRe)) {
+      cut = Math.max(cut, match.index + match[0].length);
+    }
+  }
 
-  for (const match of text.matchAll(LEADING_CLAUSE_RE)) {
-    cut = match.index + match[0].length;
+  const directPrefixAlternation = trims.directPrefixes
+    .map(escapeForRegex)
+    .join("|");
+  if (directPrefixAlternation.length > 0) {
+    const directPrefixRe = new RegExp(
+      `\\b(?:${directPrefixAlternation})${HSPACE}+(?=\\p{Lu})`,
+      "giu",
+    );
+    for (const match of text.matchAll(directPrefixRe)) {
+      const before = text.slice(0, match.index);
+      const words = before.match(/\p{L}[\p{L}\p{M}]*/gu) ?? [];
+      const hasProsePrefix =
+        words.length >= 3 && words.some((word) => /\p{Ll}/u.test(word));
+      if (hasProsePrefix) {
+        cut = Math.max(cut, match.index + match[0].length);
+      }
+    }
+  }
+  for (const match of text.matchAll(/,/gu)) {
+    const comma = match.index;
+    if (comma === undefined) {
+      continue;
+    }
+    const before = text.slice(0, comma);
+    if (!/\d/u.test(before)) {
+      continue;
+    }
+    const after = text.slice(comma + 1);
+    const leadingWs = after.match(/^\s*/u)?.[0].length ?? 0;
+    const candidate = after.slice(leadingWs);
+    const upperWords = candidate.match(/\p{Lu}[\p{L}\p{M}\p{N}]*/gu) ?? [];
+    if (upperWords.length >= 3) {
+      cut = Math.max(cut, comma + 1 + leadingWs);
+    }
   }
 
   if (cut <= 0) {
@@ -1248,7 +1497,7 @@ export const processLegalFormMatches = (
       }
     }
 
-    if (processedText.includes("\n")) {
+    if (processedText.includes("\n") && hasDisallowedLineBreak(processedText)) {
       continue;
     }
 
@@ -1271,113 +1520,132 @@ export const processLegalFormMatches = (
       }
     }
 
-    const listTrim = trimEmbeddedLegalFormListPrefix(entityStart, entityText);
-    entityStart = listTrim.entityStart;
-    entityText = listTrim.entityText;
+    for (const segment of splitEmbeddedLegalFormList(entityStart, entityText)) {
+      entityStart = segment.entityStart;
+      entityText = segment.entityText;
 
-    const clauseTrim = trimLeadingClause(entityText);
-    if (clauseTrim.offset > 0) {
-      entityStart += clauseTrim.offset;
-      entityText = clauseTrim.text;
-    }
+      const listTrim = trimEmbeddedLegalFormListPrefix(entityStart, entityText);
+      entityStart = listTrim.entityStart;
+      entityText = listTrim.entityText;
 
-    // Reject all-caps matches only if the entire
-    // surrounding line is all-caps (section headings
-    // like "KUPNÍ SMLOUVA"). If only the company name
-    // is all-caps ("uzavřená s EAGLES BRNO, z.s."),
-    // keep it — max 3 all-caps words are allowed.
-    const getPrefixInfo = (value: string) => {
-      const prefixEnd =
-        value.lastIndexOf(",") !== -1
-          ? value.lastIndexOf(",")
-          : value.lastIndexOf(" ");
-      const prefixPart =
-        prefixEnd > 0
-          ? value.slice(0, prefixEnd).replace(/[^a-zA-ZÀ-ž]/g, "")
-          : value.replace(/[^a-zA-ZÀ-ž]/g, "");
-      return { prefixEnd, prefixPart };
-    };
-    let { prefixEnd, prefixPart } = getPrefixInfo(entityText);
-    let isAllCapsMatch =
-      prefixPart.length > 2 && prefixPart === prefixPart.toUpperCase();
+      const clauseTrim = trimLeadingClause(entityText);
+      if (clauseTrim.offset > 0) {
+        entityStart += clauseTrim.offset;
+        entityText = clauseTrim.text;
+      }
 
-    if (isAllCapsMatch && fullText) {
-      // Check: is the surrounding line also all-caps?
-      const lineStart = fullText.lastIndexOf("\n", entityStart);
-      const lineEnd = fullText.indexOf("\n", entityStart + entityText.length);
-      const line = fullText.slice(
-        lineStart + 1,
-        lineEnd === -1 ? fullText.length : lineEnd,
-      );
-      const lineLetters = line.replace(/[^a-zA-ZÀ-ž]/g, "");
-      const upperCount = [...lineLetters].filter(
-        (c) => c === c.toUpperCase(),
-      ).length;
-      const lineIsAllCaps =
-        lineLetters.length > 5 && upperCount / lineLetters.length >= 0.95;
-      if (lineIsAllCaps) {
-        // Entire line is all-caps → heading, skip
+      if (entityText.includes("\n") && hasDisallowedLineBreak(entityText)) {
         continue;
       }
-      // Only the company name is all-caps → keep it
-      // (but limit to 3 words in prefix)
-      const wordCount =
-        prefixPart.length > 0
-          ? entityText
-              .slice(0, prefixEnd > 0 ? prefixEnd : entityText.length)
-              .trim()
-              .split(/\s+/).length
-          : 0;
-      if (wordCount > 3) {
-        // Keep the original regex match if backward
-        // extension alone pushed the name past the
-        // all-caps 3-word guard.
-        entityStart = match.start;
-        entityText = text;
-        ({ prefixEnd, prefixPart } = getPrefixInfo(entityText));
-        isAllCapsMatch =
-          prefixPart.length > 2 && prefixPart === prefixPart.toUpperCase();
+
+      // Reject all-caps matches only if the entire
+      // surrounding line is all-caps (section headings
+      // like "KUPNÍ SMLOUVA"). If only the company name
+      // is all-caps ("uzavřená s EAGLES BRNO, z.s."),
+      // keep it — max 3 all-caps words are allowed.
+      const getPrefixInfo = (value: string) => {
+        const prefixEnd =
+          value.lastIndexOf(",") !== -1
+            ? value.lastIndexOf(",")
+            : value.lastIndexOf(" ");
+        const prefixPart =
+          prefixEnd > 0
+            ? value.slice(0, prefixEnd).replace(/[^a-zA-ZÀ-ž]/g, "")
+            : value.replace(/[^a-zA-ZÀ-ž]/g, "");
+        return { prefixEnd, prefixPart };
+      };
+      let { prefixEnd, prefixPart } = getPrefixInfo(entityText);
+      let isAllCapsMatch =
+        prefixPart.length > 2 && prefixPart === prefixPart.toUpperCase();
+
+      if (isAllCapsMatch && fullText) {
+        // Check: is the surrounding line also all-caps?
+        const lineStart = fullText.lastIndexOf("\n", entityStart);
+        const lineEnd = fullText.indexOf("\n", entityStart + entityText.length);
+        const line = fullText.slice(
+          lineStart + 1,
+          lineEnd === -1 ? fullText.length : lineEnd,
+        );
+        const lineLetters = line.replace(/[^a-zA-ZÀ-ž]/g, "");
+        const upperCount = [...lineLetters].filter(
+          (c) => c === c.toUpperCase(),
+        ).length;
+        const lineIsAllCaps =
+          lineLetters.length > 5 && upperCount / lineLetters.length >= 0.95;
+        if (lineIsAllCaps) {
+          // Entire line is all-caps → heading, skip
+          continue;
+        }
+        // Only the company name is all-caps → keep it
+        // (but limit to 3 words in prefix)
+        const wordCount =
+          prefixPart.length > 0
+            ? entityText
+                .slice(0, prefixEnd > 0 ? prefixEnd : entityText.length)
+                .trim()
+                .split(/\s+/).length
+            : 0;
+        if (wordCount > 3) {
+          // Keep the original regex match if backward
+          // extension alone pushed the name past the
+          // all-caps 3-word guard.
+          entityStart = match.start;
+          entityText = text;
+          ({ prefixEnd, prefixPart } = getPrefixInfo(entityText));
+          isAllCapsMatch =
+            prefixPart.length > 2 && prefixPart === prefixPart.toUpperCase();
+        }
+      } else if (isAllCapsMatch) {
+        // No fullText available — fall back to rejecting
+        continue;
       }
-    } else if (isAllCapsMatch) {
-      // No fullText available — fall back to rejecting
-      continue;
-    }
 
-    // Reject Roman numeral suffixes
-    const lastSpace = entityText.lastIndexOf(" ");
-    const rawSuffix = lastSpace !== -1 ? entityText.slice(lastSpace + 1) : "";
-    const suffixClean = rawSuffix.replace(/[.,]/g, "");
-    if (suffixClean.length > 0 && ROMAN_NUMERAL_RE.test(suffixClean)) {
-      continue;
-    }
+      // Reject Roman numeral suffixes
+      const lastSuffixSeparator = findLastSuffixSeparator(entityText);
+      const rawSuffix =
+        lastSuffixSeparator !== -1
+          ? entityText.slice(lastSuffixSeparator + 1)
+          : "";
+      const suffixClean = rawSuffix.replace(/[.,]/g, "");
+      if (suffixClean.length > 0 && ROMAN_NUMERAL_RE.test(suffixClean)) {
+        continue;
+      }
 
-    // Short ASCII-only suffixes (NA, PA, LP, PC) are
-    // US-specific. Reject if the prefix contains non-
-    // ASCII chars (Czech/Slovak diacritics) — a US
-    // legal entity wouldn't have "ÚČASTI MSP NA".
-    // Test for dots in the raw suffix (before dot
-    // stripping) to protect Czech dotted forms like
-    // "a.s." and "k.s.".
-    if (
-      suffixClean.length <= 2 &&
-      !/\./.test(rawSuffix) &&
-      /[^\x00-\x7F]/.test(
-        entityText.slice(0, lastSpace !== -1 ? lastSpace : entityText.length),
-      )
-    ) {
-      continue;
-    }
+      // Short ASCII-only suffixes (NA, PA, LP, PC) are
+      // US-specific. Reject if the prefix contains non-
+      // ASCII chars (Czech/Slovak diacritics) — a US
+      // legal entity wouldn't have "ÚČASTI MSP NA".
+      // Test for dots in the raw suffix (before dot
+      // stripping) to protect Czech dotted forms like
+      // "a.s." and "k.s.".
+      if (
+        suffixClean.length <= 2 &&
+        !/\./.test(rawSuffix) &&
+        /[^\x00-\x7F]/.test(
+          stripDocxSpaces(
+            entityText.slice(
+              0,
+              lastSuffixSeparator !== -1
+                ? lastSuffixSeparator
+                : entityText.length,
+            ),
+          ),
+        )
+      ) {
+        continue;
+      }
 
-    // Definitive legal forms (s.r.o., a.s., GmbH, etc.)
-    // get score 0.95 to beat person names in dedup.
-    results.push({
-      start: entityStart,
-      end: entityStart + entityText.length,
-      label: "organization",
-      text: entityText,
-      score: 0.95,
-      source: DETECTION_SOURCES.LEGAL_FORM,
-    });
+      // Definitive legal forms (s.r.o., a.s., GmbH, etc.)
+      // get score 0.95 to beat person names in dedup.
+      results.push({
+        start: entityStart,
+        end: entityStart + entityText.length,
+        label: "organization",
+        text: entityText,
+        score: 0.95,
+        source: DETECTION_SOURCES.LEGAL_FORM,
+      });
+    }
   }
 
   return results;

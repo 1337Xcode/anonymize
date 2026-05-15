@@ -626,7 +626,9 @@ const configKey = (
     `${config.enableTriggerPhrases}:` +
     `${legalFormsEnabled}:` +
     `${config.enableNameCorpus}:` +
+    `${config.nameCorpusLanguages?.toSorted().join(",") ?? ""}:` +
     `${config.enableRegex}:` +
+    `${config.labels.toSorted().join(",")}:` +
     `${config.denyListCountries?.toSorted().join(",") ?? ""}:` +
     `${config.denyListRegions?.toSorted().join(",") ?? ""}:` +
     `${config.denyListExcludeCategories?.toSorted().join(",") ?? ""}:` +
@@ -668,6 +670,25 @@ const getCachedSearch = async (
   }
   return result;
 };
+
+export type PipelineSearchOptions = {
+  config: PipelineConfig;
+  gazetteerEntries?: GazetteerEntry[];
+  context?: PipelineContext;
+};
+
+/**
+ * Pre-build and cache the unified search instance for a
+ * pipeline configuration. Use the same context in
+ * `runPipeline` to reuse the prepared automata without
+ * passing `cachedSearch` around manually.
+ */
+export const preparePipelineSearch = ({
+  config,
+  gazetteerEntries = [],
+  context,
+}: PipelineSearchOptions): Promise<UnifiedSearchInstance> =>
+  getCachedSearch(config, gazetteerEntries, context ?? defaultContext);
 
 /**
  * Options for {@link runPipeline}.
@@ -776,7 +797,11 @@ export const runPipeline = async (
   // allow list, and person stopwords are loaded so
   // processDenyListMatches filters correctly.
   if (cachedSearch && config.enableDenyList) {
-    await ensureDenyListData(ctx, config.dictionaries);
+    await ensureDenyListData(
+      ctx,
+      config.dictionaries,
+      config.nameCorpusLanguages,
+    );
   }
 
   // Classify document zones once up front
@@ -797,9 +822,16 @@ export const runPipeline = async (
         expandLabelsForHotwordRules(config.labels),
       )
     : allowedLabels;
+  const searchConfig = hotwordsActive
+    ? {
+        ...config,
+        labels: [...expandLabelsForHotwordRules(config.labels)],
+      }
+    : config;
 
   const search =
-    cachedSearch ?? (await getCachedSearch(config, gazetteerEntries, ctx));
+    cachedSearch ??
+    (await getCachedSearch(searchConfig, gazetteerEntries, ctx));
 
   checkAbort(signal);
 
@@ -888,7 +920,7 @@ export const runPipeline = async (
   let rawNameCorpusEntities: Entity[] = [];
   let nameCorpusEntities: Entity[] = [];
   if (config.enableNameCorpus && !config.enableDenyList) {
-    await initNameCorpus(ctx, config.dictionaries);
+    await initNameCorpus(ctx, config.dictionaries, config.nameCorpusLanguages);
     checkAbort(signal);
     rawNameCorpusEntities = detectNameCorpus(fullText, ctx);
     nameCorpusEntities = filterAllowedLabels(

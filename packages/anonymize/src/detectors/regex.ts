@@ -2,9 +2,11 @@ import type { Match } from "@stll/text-search";
 import type { Validator } from "@stll/stdnum";
 import {
   at,
+  au,
   be,
   bg,
   br,
+  ch,
   cz,
   cy,
   de,
@@ -24,12 +26,14 @@ import {
   lv,
   mt,
   nl,
+  no,
   pl,
   pt,
   ro,
   se,
   si,
   sk,
+  us,
 } from "@stll/stdnum";
 import { toRegex } from "@stll/stdnum/patterns";
 
@@ -226,6 +230,17 @@ const STDNUM_ENTRIES: readonly StdnumEntry[] = [
   toEntry(at.tin, "tax identification number", 0.9),
   toEntry(at.businessid, "registration number", 0.95),
 
+  // ── CH validators ────────────────────────────────
+  // Swiss UID: CHE + 9 digits with checksum. It is a
+  // company identifier; VAT-specific usage reuses the
+  // same base number with tax suffixes, so the bare
+  // shape is labelled as registration number.
+  toEntry(ch.uid, "registration number", 0.95),
+
+  // ── AU validators ────────────────────────────────
+  toEntry(au.abn, "tax identification number", 0.9),
+  toEntry(au.acn, "registration number", 0.9),
+
   // ── BE validators ────────────────────────────────
   toEntry(be.vat, "tax identification number", 0.95),
   toEntry(be.nn, "national identification number", 0.9),
@@ -233,6 +248,10 @@ const STDNUM_ENTRIES: readonly StdnumEntry[] = [
   // ── NL validators ────────────────────────────────
   toEntry(nl.vat, "tax identification number", 0.95),
   // nl.bsn omitted: \d{9} too generic
+
+  // ── NO validators ────────────────────────────────
+  toEntry(no.orgnr, "registration number", 0.9),
+  toEntry(no.mva, "tax identification number", 0.95),
 
   // ── DK validators ────────────────────────────────
   toEntry(dk.vat, "tax identification number", 0.95),
@@ -305,6 +324,9 @@ const STDNUM_ENTRIES: readonly StdnumEntry[] = [
 
   // ── LU validators ────────────────────────────────
   toEntry(lu.vat, "tax identification number", 0.95),
+
+  // ── US validators ────────────────────────────────
+  toEntry(us.ein, "tax identification number", 0.9),
 
   // ── BR validators ────────────────────────────────
   // CPF (personal tax ID, 11 digits, checksum). Higher
@@ -531,6 +553,36 @@ const ES_CIF: RegexDef = {
   label: "registration number",
   score: 0.95,
   validator: es.cif,
+};
+
+const AU_ABN_FORMATTED: RegexDef = {
+  pattern: `\\b\\d{2}[^\\S\\n]\\d{3}[^\\S\\n]\\d{3}[^\\S\\n]\\d{3}\\b`,
+  label: "tax identification number",
+  score: 0.95,
+  validator: au.abn,
+};
+
+const NO_ORGNR_FORMATTED: RegexDef = {
+  pattern: `\\b\\d{3}[^\\S\\n]\\d{3}[^\\S\\n]\\d{3}\\b`,
+  label: "registration number",
+  score: 0.9,
+  validator: no.orgnr,
+};
+
+const NO_MVA_FORMATTED: RegexDef = {
+  pattern:
+    `\\bNO[^\\S\\n]?\\d{3}[^\\S\\n]?\\d{3}` +
+    `[^\\S\\n]?\\d{3}[^\\S\\n]?MVA\\b`,
+  label: "tax identification number",
+  score: 0.95,
+  validator: no.mva,
+};
+
+const US_EIN_FORMATTED: RegexDef = {
+  pattern: `\\b\\d{2}${DASH}\\d{7}\\b`,
+  label: "tax identification number",
+  score: 0.95,
+  validator: us.ein,
 };
 
 // Brazilian CEP (Código de Endereçamento Postal):
@@ -820,6 +872,10 @@ const ALL_REGEX_DEFS: readonly RegexDef[] = [
   ES_DNI,
   ES_NIE,
   ES_CIF,
+  AU_ABN_FORMATTED,
+  NO_ORGNR_FORMATTED,
+  NO_MVA_FORMATTED,
+  US_EIN_FORMATTED,
   BR_CPF_FORMATTED,
   BR_CNPJ_FORMATTED,
   BR_RG_WITH_SSP,

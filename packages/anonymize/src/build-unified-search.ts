@@ -47,6 +47,7 @@ import { buildTriggerPatterns } from "./detectors/triggers";
 import { buildDenyList } from "./detectors/deny-list";
 import { buildStreetTypePatterns } from "./detectors/address-seeds";
 import { buildGazetteerPatterns } from "./detectors/gazetteer";
+import { expandLabelsForHotwordRules } from "./filters/hotword-rules";
 
 const DEFAULT_CUSTOM_REGEX_SCORE = 0.9;
 const ALNUM_RE = /[\p{L}\p{N}]/u;
@@ -55,6 +56,15 @@ type PatternSlice = {
   start: number;
   end: number;
 };
+
+const createAllowedLabelSet = (
+  labels: readonly string[],
+): ReadonlySet<string> | null => (labels.length > 0 ? new Set(labels) : null);
+
+const labelIsAllowed = (
+  label: string,
+  allowedLabels: ReadonlySet<string> | null,
+): boolean => allowedLabels === null || allowedLabels.has(label);
 
 export type GazetteerData = {
   /** Maps local pattern index to entry label. */
@@ -95,7 +105,16 @@ export const buildUnifiedSearch = async (
   ctx: PipelineContext = defaultContext,
 ): Promise<UnifiedSearchInstance> => {
   const legalFormsEnabled = isLegalFormsEnabled(config);
-  const customRegexes = config.enableRegex ? (config.customRegexes ?? []) : [];
+  const searchLabels =
+    config.enableHotwordRules === true
+      ? expandLabelsForHotwordRules(config.labels)
+      : config.labels;
+  const allowedLabels = createAllowedLabelSet(searchLabels);
+  const customRegexes = config.enableRegex
+    ? (config.customRegexes ?? []).filter((entry) =>
+        labelIsAllowed(entry.label, allowedLabels),
+      )
+    : [];
   const [
     legalForms,
     triggers,
@@ -116,9 +135,15 @@ export const buildUnifiedSearch = async (
         }),
     config.enableDenyList ? buildDenyList(config, ctx) : Promise.resolve(null),
     buildStreetTypePatterns(),
-    getCurrencyPatterns(),
-    getDatePatterns(),
-    getSigningClausePatterns(),
+    config.enableRegex && labelIsAllowed("monetary amount", allowedLabels)
+      ? getCurrencyPatterns()
+      : Promise.resolve([] as string[]),
+    config.enableRegex && labelIsAllowed("date", allowedLabels)
+      ? getDatePatterns()
+      : Promise.resolve([] as string[]),
+    config.enableRegex && labelIsAllowed("address", allowedLabels)
+      ? getSigningClausePatterns()
+      : Promise.resolve([] as string[]),
   ]);
 
   // ── Instance 1: regex + triggers + legal-forms ──
@@ -131,18 +156,30 @@ export const buildUnifiedSearch = async (
   // Currency patterns (from currencies.json) are
   // appended after the static regex patterns; their
   // meta is spliced into regexMeta at the same offset.
-  const allRegex = [
-    ...(REGEX_PATTERNS as string[]),
-    ...currencyPatterns,
-    ...datePatterns,
-    ...signingPatterns,
-  ];
-  const regexMeta: RegexMeta[] = [
-    ...REGEX_META,
-    ...currencyPatterns.map(() => CURRENCY_PATTERN_META),
-    ...datePatterns.map(() => DATE_PATTERN_META),
-    ...signingPatterns.map(() => SIGNING_CLAUSE_META),
-  ];
+  const allRegex: string[] = [];
+  const regexMeta: RegexMeta[] = [];
+  if (config.enableRegex) {
+    for (const [index, pattern] of REGEX_PATTERNS.entries()) {
+      const meta = REGEX_META[index];
+      if (!meta || !labelIsAllowed(meta.label, allowedLabels)) {
+        continue;
+      }
+      allRegex.push(pattern);
+      regexMeta.push(meta);
+    }
+  }
+  for (const pattern of currencyPatterns) {
+    allRegex.push(pattern);
+    regexMeta.push(CURRENCY_PATTERN_META);
+  }
+  for (const pattern of datePatterns) {
+    allRegex.push(pattern);
+    regexMeta.push(DATE_PATTERN_META);
+  }
+  for (const pattern of signingPatterns) {
+    allRegex.push(pattern);
+    regexMeta.push(SIGNING_CLAUSE_META);
+  }
   const customRegexMeta: RegexMeta[] = customRegexes.map((entry) => ({
     label: entry.label,
     score: entry.score ?? DEFAULT_CUSTOM_REGEX_SCORE,

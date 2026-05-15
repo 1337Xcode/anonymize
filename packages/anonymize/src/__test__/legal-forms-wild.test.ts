@@ -66,6 +66,25 @@ const expectNoOrg = async (text: string) => {
   expect(orgs.length).toBe(0);
 };
 
+const expectOrgBeatsCityAddress = async (text: string, expected: string) => {
+  const entities = await runPipeline({
+    fullText: text,
+    config: {
+      ...CONFIG,
+      enableDenyList: true,
+      dictionaries: { cities: ["Bratislava"] },
+    },
+    gazetteerEntries: [],
+    context: createPipelineContext(),
+  });
+  expect(
+    entities.some((e) => e.label === "organization" && e.text === expected),
+  ).toBe(true);
+  expect(
+    entities.some((e) => e.label === "address" && e.text === "Bratislava"),
+  ).toBe(false);
+};
+
 // ── Czech s.r.o. ──────────────────────────────
 
 describe("Czech s.r.o. companies", () => {
@@ -105,6 +124,31 @@ describe("Czech s.r.o. companies", () => {
 
   test("English words in name", async () => {
     await expectOrg("Be a Future s.r.o.", "Be a Future s.r.o.");
+  });
+
+  test("DOCX non-breaking spaces in company name", async () => {
+    await expectOrg("IKEA Bratislava, s.r.o.", "IKEA Bratislava, s.r.o.");
+  });
+
+  test("organization span beats inner city address", async () => {
+    await expectOrgBeatsCityAddress(
+      "IKEA Bratislava, s.r.o.",
+      "IKEA Bratislava, s.r.o.",
+    );
+  });
+
+  test("clause text before by is trimmed from company name", async () => {
+    await expectOrg(
+      "THIS CERTIFIES THAT in exchange for the joint payment by  IKEA Bratislava, s.r.o., IČ 35 849 436",
+      "IKEA Bratislava, s.r.o.",
+    );
+  });
+
+  test("clause-trimmed organization span beats inner city address", async () => {
+    await expectOrgBeatsCityAddress(
+      "THIS CERTIFIES THAT in exchange for the joint payment by  IKEA Bratislava, s.r.o., IČ 35 849 436",
+      "IKEA Bratislava, s.r.o.",
+    );
   });
 });
 
@@ -181,6 +225,49 @@ describe("German legal forms", () => {
 
   test("AG", async () => {
     await expectOrg("Deutsche Bank AG", "Deutsche Bank AG");
+  });
+
+  test("date prefix before comma is trimmed from company name", async () => {
+    await expectOrg(
+      "29 August 2024, The Swatch Group AG, CHE-101.374.515",
+      "The Swatch Group AG",
+    );
+  });
+});
+
+// ── SEC merger agreement regressions ───────────────
+
+describe("SEC merger agreement organizations", () => {
+  test("preamble party list keeps each legal-form entity", async () => {
+    await expectOrgs(
+      "by and among X Holdings I, Inc., X Holdings II, Inc. and Twitter, Inc.",
+      ["X Holdings I, Inc.", "X Holdings II, Inc.", "Twitter, Inc."],
+    );
+  });
+
+  test("financial advisor comma list keeps full organization names", async () => {
+    await expectOrgs(
+      "Goldman Sachs & Co. LLC, J.P. Morgan Securities LLC and Allen & Company LLC",
+      [
+        "Goldman Sachs & Co. LLC",
+        "J.P. Morgan Securities LLC",
+        "Allen & Company LLC",
+      ],
+    );
+  });
+
+  test("edgar line wrap before terminal suffix stays in one organization", async () => {
+    await expectOrg(
+      "between the Company and Goldman Sachs & Co.\nLLC, (iv) the call option",
+      "Goldman Sachs & Co. LLC",
+    );
+  });
+
+  test("national bank suffix keeps dotted N.A. legal form", async () => {
+    await expectOrg(
+      "between the Company and Bank of America, N.A., (ii) the warrant confirmation",
+      "Bank of America, N.A.",
+    );
   });
 });
 

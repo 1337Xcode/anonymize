@@ -25,6 +25,7 @@ export type DenyListConfig = Pick<
   PipelineConfig,
   | "enableDenyList"
   | "enableNameCorpus"
+  | "nameCorpusLanguages"
   | "denyListCountries"
   | "denyListRegions"
   | "denyListExcludeCategories"
@@ -58,6 +59,30 @@ const EMPTY_ALLOW_LIST: ReadonlySet<string> = new Set();
 /** Sync accessor — returns empty set before init. */
 const getAllowList = (ctx: PipelineContext): ReadonlySet<string> =>
   ctx.allowList ?? EMPTY_ALLOW_LIST;
+
+let commonWordsPromise: Promise<ReadonlySet<string>> | null = null;
+let commonWordsCache: ReadonlySet<string> | null = null;
+
+const loadCommonWords = (): Promise<ReadonlySet<string>> => {
+  if (commonWordsCache) return Promise.resolve(commonWordsCache);
+  if (commonWordsPromise) return commonWordsPromise;
+  commonWordsPromise = (async () => {
+    try {
+      const mod: { default?: { words?: string[] } } =
+        await import("../data/common-words-en.json");
+      const set: ReadonlySet<string> = new Set(
+        (mod.default?.words ?? []).map((word) => word.toLowerCase()),
+      );
+      commonWordsCache = set;
+      return set;
+    } catch {
+      const empty: ReadonlySet<string> = new Set();
+      commonWordsCache = empty;
+      return empty;
+    }
+  })();
+  return commonWordsPromise;
+};
 
 /**
  * Curated dictionary entries that are pure dotted
@@ -407,6 +432,7 @@ const isInitialContinuationGap = (text: string, gap: string): boolean =>
 /**
  * Source tag for each pattern in the automaton.
  * "deny-list" = standard deny list entry
+ * "city" = city dictionary entry
  * "custom-deny-list" = caller-owned exact term
  * "first-name" = name corpus first name
  * "surname" = name corpus surname
@@ -414,6 +440,7 @@ const isInitialContinuationGap = (text: string, gap: string): boolean =>
  */
 type PatternSource =
   | "deny-list"
+  | "city"
   | "custom-deny-list"
   | "first-name"
   | "surname"
@@ -441,6 +468,39 @@ export type DenyListData = {
   sources: PatternSource[][];
 };
 
+const getCityEntries = (
+  dictionaries: Dictionaries | undefined,
+  allowedCountries: ReadonlySet<string> | null,
+): readonly string[] => {
+  const byCountry = dictionaries?.citiesByCountry;
+  if (!byCountry) {
+    return dictionaries?.cities ?? [];
+  }
+
+  const result: string[] = [];
+  const append = (entries: readonly string[] | undefined) => {
+    if (!entries) {
+      return;
+    }
+    for (const entry of entries) {
+      result.push(entry);
+    }
+  };
+
+  if (allowedCountries === null) {
+    for (const entries of Object.values(byCountry)) {
+      append(entries);
+    }
+    return result;
+  }
+
+  for (const country of allowedCountries) {
+    append(byCountry[country.toUpperCase()]);
+  }
+
+  return result;
+};
+
 /**
  * Resolve which dictionaries to load based on country
  * and category filters, then build the deny list data.
@@ -458,7 +518,7 @@ export const buildDenyList = async (
   // Pre-load name corpus so getNameCorpus*() accessors
   // and getFirstNameExclusions() are populated before
   // stopwords filtering runs.
-  await initNameCorpus(ctx, config.dictionaries);
+  await initNameCorpus(ctx, config.dictionaries, config.nameCorpusLanguages);
   // Pre-load all JSON data so sync accessors are
   // populated before processDenyListMatches runs.
   await Promise.all([
@@ -466,26 +526,28 @@ export const buildDenyList = async (
     loadAllowList(ctx),
     loadPersonStopwords(ctx),
     loadAddressStopwords(ctx),
+    loadCommonWords(),
     loadStreetTypeRe(),
     loadGenericRoles(ctx),
   ]);
+  const commonWords = await loadCommonWords();
 
   const dictionaries = config.dictionaries;
   const hasDenyList = dictionaries?.denyList && dictionaries?.denyListMeta;
-  const hasCities = dictionaries?.cities && dictionaries.cities.length > 0;
   const hasCustomDenyList =
     config.customDenyList !== undefined && config.customDenyList.length > 0;
+  const allowedCountries = resolveCountries(
+    config.denyListRegions,
+    config.denyListCountries,
+  );
+  const cityEntries = getCityEntries(dictionaries, allowedCountries);
+  const hasCities = cityEntries.length > 0;
 
   // No dictionary data available — skip deny-list building
   if (!hasDenyList && !hasCities && !hasCustomDenyList) {
     // Still build name corpus entries if available
     return buildNameCorpusOnly(config, ctx);
   }
-
-  const allowedCountries = resolveCountries(
-    config.denyListRegions,
-    config.denyListCountries,
-  );
 
   const excluded = config.denyListExcludeCategories;
   const excludeCategories = excluded ? new Set(excluded) : new Set<string>();
@@ -513,14 +575,15 @@ export const buildDenyList = async (
     if (normalized.length === 0) {
       return;
     }
-    if (
-      source !== "custom-deny-list" &&
-      label !== "address" &&
-      isShortCuratedNoiseAcronym(normalized)
-    ) {
-      return;
-    }
     const lower = normalized.toLowerCase();
+    if (source !== "custom-deny-list" && label !== "address") {
+      if (SINGLE_WORD_RE.test(normalized) && commonWords.has(lower)) {
+        return;
+      }
+      if (isShortCuratedNoiseAcronym(normalized)) {
+        return;
+      }
+    }
     const existing = patternIndex.get(lower);
     if (existing !== undefined) {
       if (!labelList[existing]!.includes(label)) {
@@ -548,6 +611,7 @@ export const buildDenyList = async (
   if (hasDenyList) {
     const denyListData = dictionaries.denyList!;
     const metaData = dictionaries.denyListMeta!;
+    const useScopedNameCorpus = config.nameCorpusLanguages !== undefined;
 
     for (const [id, entries] of Object.entries(denyListData)) {
       const meta: DictionaryMeta | undefined = metaData[id];
@@ -556,6 +620,10 @@ export const buildDenyList = async (
       }
 
       if (!config.enableNameCorpus && meta.category === "Names") {
+        continue;
+      }
+
+      if (useScopedNameCorpus && meta.category === "Names") {
         continue;
       }
 
@@ -577,8 +645,8 @@ export const buildDenyList = async (
 
   // Add pre-loaded city entries
   if (hasCities && !excludeCategories.has("Places")) {
-    for (const entry of dictionaries.cities!) {
-      addDenyListEntry(entry, "address");
+    for (const entry of cityEntries) {
+      addDenyListEntry(entry, "address", "city");
     }
   }
 
@@ -774,11 +842,12 @@ const customMatchHasValidEdges = (
 export const ensureDenyListData = async (
   ctx: PipelineContext = defaultContext,
   dictionaries?: Dictionaries,
+  nameCorpusLanguages?: readonly string[],
 ): Promise<void> => {
   // INVARIANT: initNameCorpus must resolve before
   // loadStopwords so first-name exclusions are
   // available when computing the stopword set.
-  await initNameCorpus(ctx, dictionaries);
+  await initNameCorpus(ctx, dictionaries, nameCorpusLanguages);
   await Promise.all([
     loadStopwords(ctx),
     loadAllowList(ctx),
@@ -1177,7 +1246,9 @@ const extendCityDistricts = (entities: Entity[], fullText: string): void => {
     // Dash-separated district name:
     // "Praha 10 - Strašnice", "Havířov – Město"
     const afterDistrict = fullText.slice(entity.end);
-    const dashDistrictM = /^[\s]*[-–][\s]*(\p{Lu}\p{Ll}+)/u.exec(afterDistrict);
+    const dashDistrictM = /^[ \t]{1,4}[-–][ \t]*(\p{Lu}\p{Ll}+)/u.exec(
+      afterDistrict,
+    );
     if (dashDistrictM && !dashDistrictM[0].includes("\n")) {
       entity.end += dashDistrictM[0].length;
       entity.text = fullText.slice(entity.start, entity.end);

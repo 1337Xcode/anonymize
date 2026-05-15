@@ -44,31 +44,54 @@ export const getNameCorpusExcluded = (
 export const initNameCorpus = (
   ctx: PipelineContext = defaultContext,
   dictionaries?: Dictionaries,
+  languages?: readonly string[],
 ): Promise<void> => {
-  if (ctx.nameCorpusPromise) return ctx.nameCorpusPromise;
+  const languageKey = languages?.toSorted().join(",") ?? "*";
+  if (ctx.nameCorpus && ctx.nameCorpusKey === languageKey) {
+    return Promise.resolve();
+  }
+  if (ctx.nameCorpusPromise && ctx.nameCorpusKey === languageKey) {
+    return ctx.nameCorpusPromise;
+  }
+  ctx.nameCorpus = null;
+  ctx.nameCorpusKey = languageKey;
   const promise = (async () => {
     try {
       // Load legacy config files (backwards compat)
-      const [legacyFirstMod, legacySurnameMod, titleMod, exclusionMod] =
-        await Promise.all([
-          import("../data/names-first.json") as Promise<{
-            default: { names: string[] };
-          }>,
-          import("../data/names-surnames.json") as Promise<{
-            default: { names: string[] };
-          }>,
-          import("../data/names-title-tokens.json") as Promise<{
-            default: { tokens: string[] };
-          }>,
-          import("../data/names-exclusions.json") as Promise<{
-            default: { words: string[] };
-          }>,
-        ]);
+      const [
+        legacyFirstMod,
+        legacySurnameMod,
+        titleMod,
+        exclusionMod,
+        commonWordsMod,
+      ] = await Promise.all([
+        import("../data/names-first.json") as Promise<{
+          default: { names: string[] };
+        }>,
+        import("../data/names-surnames.json") as Promise<{
+          default: { names: string[] };
+        }>,
+        import("../data/names-title-tokens.json") as Promise<{
+          default: { tokens: string[] };
+        }>,
+        import("../data/names-exclusions.json") as Promise<{
+          default: { words: string[] };
+        }>,
+        import("../data/common-words-en.json") as Promise<{
+          default: { words: string[] };
+        }>,
+      ]);
 
       // Merge: legacy config + injected per-language files
       const firstNames: string[] = [...legacyFirstMod.default.names];
       if (dictionaries?.firstNames) {
-        for (const names of Object.values(dictionaries.firstNames)) {
+        const entries =
+          languages === undefined
+            ? Object.entries(dictionaries.firstNames)
+            : Object.entries(dictionaries.firstNames).filter(([language]) =>
+                languages.includes(language),
+              );
+        for (const [, names] of entries) {
           for (const name of names) {
             firstNames.push(name);
           }
@@ -77,7 +100,13 @@ export const initNameCorpus = (
 
       const surnames: string[] = [...legacySurnameMod.default.names];
       if (dictionaries?.surnames) {
-        for (const names of Object.values(dictionaries.surnames)) {
+        const entries =
+          languages === undefined
+            ? Object.entries(dictionaries.surnames)
+            : Object.entries(dictionaries.surnames).filter(([language]) =>
+                languages.includes(language),
+              );
+        for (const [, names] of entries) {
           for (const name of names) {
             surnames.push(name);
           }
@@ -96,8 +125,13 @@ export const initNameCorpus = (
         return result;
       };
 
+      const commonWords = new Set(
+        commonWordsMod.default.words.map((word) => word.toLowerCase()),
+      );
       const dedupFirst = dedup(firstNames);
-      const dedupSurnames = dedup(surnames);
+      const dedupSurnames = dedup(surnames).filter(
+        (name) => !commonWords.has(name.toLowerCase()),
+      );
       const titles = titleMod.default.tokens;
       const exclusions = exclusionMod.default.words;
 

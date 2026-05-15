@@ -258,4 +258,33 @@ describe("contract quality regressions", () => {
       false,
     );
   });
+
+  test("keeps Twitter merger agreement organization names stable", async () => {
+    const entities = await detect(
+      "THIS AGREEMENT AND PLAN OF MERGER, dated as of April 25, 2022, is made by and among Twitter, Inc., a Delaware corporation, X Holdings I, Inc., a Delaware corporation, X Holdings II, Inc., a Delaware corporation. " +
+        "The confirmations include transactions between the Company and Bank of America, N.A., and between the Company and Goldman Sachs & Co.\nLLC. " +
+        'Except for Goldman Sachs & Co. LLC ("Goldman Sachs"), J.P. Morgan Securities LLC ("J.P.\nMorgan") and Allen & Company LLC, no broker is entitled to any fee.',
+    );
+
+    const orgTexts = new Set(
+      entities
+        .filter((entity) => entity.label === "organization")
+        .map((entity) => entity.text),
+    );
+    expect(orgTexts.has("Twitter, Inc.")).toBe(true);
+    expect(orgTexts.has("X Holdings I, Inc.")).toBe(true);
+    expect(orgTexts.has("X Holdings II, Inc.")).toBe(true);
+    expect(orgTexts.has("Goldman Sachs & Co. LLC")).toBe(true);
+    expect(orgTexts.has("J.P. Morgan Securities LLC")).toBe(true);
+    expect(orgTexts.has("Bank of America, N.A.")).toBe(true);
+
+    const personTexts = new Set(
+      entities
+        .filter((entity) => entity.label === "person")
+        .map((entity) => entity.text),
+    );
+    expect(personTexts.has("Goldman")).toBe(false);
+    expect(personTexts.has("Goldman Sachs")).toBe(false);
+    expect(personTexts.has("Sachs & Co")).toBe(false);
+  }, 15_000);
 });

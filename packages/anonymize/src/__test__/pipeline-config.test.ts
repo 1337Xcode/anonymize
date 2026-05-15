@@ -3,9 +3,12 @@ import { describe, expect, test } from "bun:test";
 import {
   createPipelineContext,
   DEFAULT_ENTITY_LABELS,
+  preparePipelineSearch,
   redactText,
   runPipeline,
 } from "../index";
+import { buildUnifiedSearch } from "../build-unified-search";
+import { REGEX_META } from "../detectors/regex";
 import type { Dictionaries, PipelineConfig } from "../types";
 import { loadTestDictionaries } from "./load-dictionaries";
 
@@ -62,6 +65,37 @@ describe("pipeline config semantics", () => {
       labels: ["person"],
     });
     expect(entities).toHaveLength(0);
+  });
+
+  test("labels filter prunes built-in regex patterns before search build", async () => {
+    const search = await buildUnifiedSearch(
+      {
+        ...BASE_CONFIG,
+        enableRegex: true,
+        labels: ["email address"],
+      },
+      [],
+      createPipelineContext(),
+    );
+    const regexCount = search.slices.regex.end - search.slices.regex.start;
+    const expected = REGEX_META.filter(
+      (meta) => meta.label === "email address",
+    ).length;
+
+    expect(regexCount).toBe(expected);
+  });
+
+  test("preparePipelineSearch reuses the context search cache", async () => {
+    const context = createPipelineContext();
+    const config = {
+      ...BASE_CONFIG,
+      enableRegex: true,
+      labels: ["email address"],
+    };
+    const first = await preparePipelineSearch({ config, context });
+    const second = await preparePipelineSearch({ config, context });
+
+    expect(second).toBe(first);
   });
 
   test("enableLegalForms flag gates legal-form detection", async () => {

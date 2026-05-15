@@ -297,8 +297,19 @@ export type Dictionaries = {
   /**
    * Pre-loaded city names, already merged across
    * all desired countries.
+   *
+   * Prefer `citiesByCountry` when callers also pass
+   * `denyListCountries` / `denyListRegions`; merged
+   * city arrays cannot be scoped after injection.
    */
   cities?: readonly string[];
+  /**
+   * Pre-loaded city names keyed by ISO 3166-1 alpha-2
+   * country code. When provided, the deny-list builder
+   * applies `denyListCountries` / `denyListRegions`
+   * before adding city patterns to the search automaton.
+   */
+  citiesByCountry?: Readonly<Record<string, readonly string[]>>;
 };
 
 export type PipelineConfig = {
@@ -319,6 +330,15 @@ export type PipelineConfig = {
    * deny-list search automaton.
    */
   enableNameCorpus: boolean;
+  /**
+   * Optional language scope for first-name/surname
+   * dictionaries, using the keys present in
+   * `dictionaries.firstNames` / `dictionaries.surnames`
+   * (for example `["en", "de"]`). When omitted, all
+   * injected name languages are used for backward
+   * compatibility.
+   */
+  nameCorpusLanguages?: string[];
   enableDenyList: boolean;
   denyListCountries?: string[];
   denyListRegions?: string[];

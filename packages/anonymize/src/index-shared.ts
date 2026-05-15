@@ -37,8 +37,17 @@ export type {
 export { corefKey, createPipelineContext } from "./context";
 
 // ── Pipeline ──────────────────────────────────────
-export { runPipeline, mergeAndDedup, sanitizeEntities } from "./pipeline";
-export type { NerInferenceFn, PipelineOptions } from "./pipeline";
+export {
+  runPipeline,
+  mergeAndDedup,
+  sanitizeEntities,
+  preparePipelineSearch,
+} from "./pipeline";
+export type {
+  NerInferenceFn,
+  PipelineOptions,
+  PipelineSearchOptions,
+} from "./pipeline";
 
 // ── Redaction ─────────────────────────────────────
 export {

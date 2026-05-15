@@ -52,6 +52,7 @@ export type PipelineContext = {
 
   // ── Name corpus ───────────────────────────────
   nameCorpus: NameCorpusData | null;
+  nameCorpusKey: string;
   nameCorpusPromise: Promise<void> | null;
 
   // ── Deny-list data sets ───────────────────────
@@ -104,6 +105,7 @@ export const createPipelineContext = (): PipelineContext => ({
   searchPromise: null,
 
   nameCorpus: null,
+  nameCorpusKey: "",
   nameCorpusPromise: null,
 
   stopwords: null,
