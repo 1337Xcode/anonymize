@@ -60,6 +60,38 @@ const getAllowList = (ctx: PipelineContext): ReadonlySet<string> =>
   ctx.allowList ?? EMPTY_ALLOW_LIST;
 
 /**
+ * Curated dictionary entries that are pure dotted
+ * single-letter acronyms (e.g. `S.C.`, `D.N.J.`, `C.E.C.`)
+ * need targeted suffix guards. The AC search matches
+ * case-insensitively on token boundaries where `.` is not
+ * a word character, so `S.C.` can match inside `U.S.C.`.
+ * Two-segment non-address aliases are too noisy and are
+ * dropped at build time; longer official aliases stay
+ * searchable and are only suppressed when the source text
+ * shows they are the tail of a longer dotted token.
+ * Caller-supplied custom entries are exempted.
+ */
+const DOTTED_ACRONYM_RE = /^(?=.{3,}$)\p{L}(?:\.\p{L}){0,3}\.?$/u;
+
+const isCuratedNoiseAcronym = (normalized: string): boolean =>
+  DOTTED_ACRONYM_RE.test(normalized);
+
+const dottedAcronymSegmentCount = (normalized: string): number =>
+  normalized.split(".").filter(Boolean).length;
+
+const isShortCuratedNoiseAcronym = (normalized: string): boolean =>
+  isCuratedNoiseAcronym(normalized) &&
+  dottedAcronymSegmentCount(normalized) <= 2;
+
+const isDottedAcronymSuffixCollision = (
+  fullText: string,
+  start: number,
+  matchText: string,
+): boolean =>
+  isCuratedNoiseAcronym(matchText) &&
+  /[\p{L}]\.$/u.test(fullText.slice(Math.max(0, start - 2), start));
+
+/**
  * Common EU given names present in the stopwords-iso dataset
  * but absent from the first-name corpus. Without this
  * supplementary set, these names would pass through the
@@ -481,6 +513,13 @@ export const buildDenyList = async (
     if (normalized.length === 0) {
       return;
     }
+    if (
+      source !== "custom-deny-list" &&
+      label !== "address" &&
+      isShortCuratedNoiseAcronym(normalized)
+    ) {
+      return;
+    }
     const lower = normalized.toLowerCase();
     const existing = patternIndex.get(lower);
     if (existing !== undefined) {
@@ -647,6 +686,9 @@ const appendNameCorpusEntries = (
     // patterns match against normalizeForSearch(text).
     const normalized = normalizeForSearch(name).replace(/[|\\]/g, "");
     if (normalized.length === 0) {
+      return;
+    }
+    if (isCuratedNoiseAcronym(normalized)) {
       return;
     }
     const lower = normalized.toLowerCase();
@@ -826,15 +868,21 @@ export const processDenyListMatches = (
             !customPatternLabels.includes(label) && customEdgesAreValid,
         )
       : [];
+    const suffixCollision = isDottedAcronymSuffixCollision(
+      fullText,
+      match.start,
+      matchText,
+    );
+    const filteredCuratedLabels = suffixCollision ? [] : curatedLabels;
 
-    if (curatedLabels.length === 0 && customLabels.length === 0) {
+    if (filteredCuratedLabels.length === 0 && customLabels.length === 0) {
       continue;
     }
 
     const entry: RawMatch = {
       start: match.start,
       end: match.end,
-      labels: curatedLabels,
+      labels: filteredCuratedLabels,
       customLabels,
       sources,
       text: matchText,
