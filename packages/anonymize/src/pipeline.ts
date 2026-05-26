@@ -3,6 +3,7 @@ import {
   findCoreferenceSpans,
 } from "./detectors/coreference";
 import { processGazetteerMatches } from "./detectors/gazetteer";
+import { processCountryMatches } from "./detectors/countries";
 import { detectNameCorpus, initNameCorpus } from "./detectors/names";
 import { detectSignatures } from "./detectors/signatures";
 import { processRegexMatches } from "./detectors/regex";
@@ -122,6 +123,31 @@ const shouldReplace = (a: Entity, b: Entity): boolean => {
   ) {
     return false;
   }
+
+  // Cross-label containment for country: a country token
+  // contained inside a longer person or organization span
+  // is almost always a first-name collision ("Chad Smith",
+  // "Georgia Smith", "Jordan Williams"). The longer span
+  // carries more evidence — keep it and drop the country.
+  if (
+    a.label === "country" &&
+    (b.label === "person" || b.label === "organization") &&
+    b.start <= a.start &&
+    b.end >= a.end &&
+    bLen > aLen
+  ) {
+    return false;
+  }
+  if (
+    b.label === "country" &&
+    (a.label === "person" || a.label === "organization") &&
+    a.start <= b.start &&
+    a.end >= b.end &&
+    aLen > bLen
+  ) {
+    return true;
+  }
+
   const aPri = DETECTOR_PRIORITY[a.source] ?? 0;
   const bPri = DETECTOR_PRIORITY[b.source] ?? 0;
   if (aPri !== bPri) return aPri > bPri;
@@ -196,9 +222,16 @@ const PRECISE_OVER_ADDRESS: ReadonlySet<string> = new Set([
  * not. Kept narrow: organizations are NOT here — "Morgan Stanley"
  * legitimately appears in both the org and name dictionaries, and
  * the existing detector priority is the right tie-breaker there.
+ *
+ * `country` is included because the country detector runs at the
+ * same offsets as deny-list person matches for names like `Chad`,
+ * `Georgia`, `Jordan` (all valid first names AND country names).
+ * Letting a higher-priority country span win there would mark
+ * `Chad Smith` as country + leave `Smith` unredacted.
  */
 const PERSON_PREFERRED_OVER: ReadonlySet<string> = new Set([
   "address",
+  "country",
   "land parcel",
 ]);
 
@@ -225,15 +258,35 @@ const resolveSameSpanLabelConflicts = (entities: Entity[]): Entity[] => {
       (l) => l !== "address" && PRECISE_OVER_ADDRESS.has(l),
     );
 
+    // Person-preferred drops are decided up front so the
+    // priority-based pass below doesn't keep a higher-pri country
+    // span (e.g., `Chad` from the country detector at priority 3)
+    // while also dropping the lower-pri person hit (`Chad` from
+    // the deny-list at priority 2) for being below the same group's
+    // max. Without this, person tokens that happen to be country
+    // names would be flipped to `country` and the surrounding
+    // surname left exposed.
+    const yieldingToPerson = new Set<Entity>();
+    if (hasPerson) {
+      for (const e of group) {
+        if (hasLockedBoundary(e)) continue;
+        if (PERSON_PREFERRED_OVER.has(e.label)) {
+          yieldingToPerson.add(e);
+        }
+      }
+    }
+
     // When entities at the same offsets have different labels,
     // also let detector priority break ties: a `legal-form`
     // organization hit (priority 3) should keep its label over a
     // coincident `deny-list` person hit (priority 2). Compute the
-    // max priority once so we can drop strictly-lower-priority
-    // duplicates regardless of label.
+    // max priority over entities NOT already yielding to person,
+    // so the person hit isn't accidentally crowded out by the
+    // priority of the very entity it's beating.
     let maxPriority = -1;
     for (const e of group) {
       if (hasLockedBoundary(e)) continue;
+      if (yieldingToPerson.has(e)) continue;
       const pri = DETECTOR_PRIORITY[e.source] ?? 0;
       if (pri > maxPriority) maxPriority = pri;
     }
@@ -243,12 +296,12 @@ const resolveSameSpanLabelConflicts = (entities: Entity[]): Entity[] => {
       // explicit user intent; never drop them in favour of a
       // detector-generated label.
       if (hasLockedBoundary(e)) continue;
-      const pri = DETECTOR_PRIORITY[e.source] ?? 0;
-      if (pri < maxPriority) {
+      if (yieldingToPerson.has(e)) {
         dropped.add(e);
         continue;
       }
-      if (hasPerson && PERSON_PREFERRED_OVER.has(e.label)) {
+      const pri = DETECTOR_PRIORITY[e.source] ?? 0;
+      if (pri < maxPriority) {
         dropped.add(e);
         continue;
       }
@@ -635,7 +688,8 @@ const configKey = (
     `${config.denyListExcludeCategories?.toSorted().join(",") ?? ""}:` +
     `${customDenyFingerprint}:` +
     `${customRegexFingerprint}:` +
-    `${config.enableGazetteer}:${gazFingerprint}`
+    `${config.enableGazetteer}:${gazFingerprint}:` +
+    `${config.enableCountries !== false}`
   );
 };
 
@@ -979,6 +1033,22 @@ export const runPipeline = async (
   if (gazetteerEntities.length > 0)
     log("gazetteer", `${gazetteerEntities.length} matches`);
 
+  const rawCountryEntities = search.countryData
+    ? processCountryMatches(
+        literalMatches,
+        slices.countries.start,
+        slices.countries.end,
+        fullText,
+        search.countryData,
+      )
+    : [];
+  const countryEntities = filterAllowedLabels(
+    rawCountryEntities,
+    preHotwordAllowedLabels,
+  );
+  if (countryEntities.length > 0)
+    log("countries", `${countryEntities.length} matches`);
+
   checkAbort(signal);
 
   const rawCustomDenyListEntities = rawDenyListEntities.filter((entity) =>
@@ -1050,6 +1120,7 @@ export const runPipeline = async (
     ...nameCorpusEntities,
     ...denyListEntities,
     ...gazetteerEntities,
+    ...countryEntities,
     ...nerEntities,
   ];
   const addressSeedEntities = labelIsAllowed("address", allowedLabels)
