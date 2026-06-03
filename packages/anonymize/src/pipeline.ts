@@ -9,9 +9,9 @@ import { detectSignatures } from "./detectors/signatures";
 import { processRegexMatches } from "./detectors/regex";
 import {
   getKnownLegalSuffixes,
-  processLegalFormMatches,
   warmLegalRoleHeads,
 } from "./detectors/legal-forms";
+import { detectLegalFormsV2 } from "./detectors/legal-forms-v2";
 import {
   processTriggerMatches,
   warmAddressStopKeywords,
@@ -33,6 +33,7 @@ import {
 import {
   filterFalsePositives,
   initAddressComponents,
+  loadDocumentStructureHeadings,
   loadGenericRoles,
 } from "./filters/false-positives";
 import {
@@ -50,6 +51,7 @@ import { enforceBoundaryConsistency } from "./filters/boundary-consistency";
 import type { Entity, GazetteerEntry, PipelineConfig } from "./types";
 import {
   DEFAULT_ENTITY_LABELS,
+  DETECTION_SOURCES,
   DETECTOR_PRIORITY,
   isLegalFormsEnabled,
 } from "./types";
@@ -80,6 +82,14 @@ const hasLockedBoundary = (entity: Entity): boolean =>
   isCallerOwnedEntity(entity);
 
 const LITERAL_BOUNDARY_PUNCT_RE = /^["“„‟‘‛'«]|["”’'»!.]$/u;
+
+// Bare postal-code shapes used by the address-containment rule.
+// Covers Czech `160 00`, German/EU `12345`, US ZIP / ZIP+4
+// (`94304`, `94304-1050`), and the standard `\d{3} \d{2}` /
+// `\d{2}-\d{3}` continental variants. Surrounding whitespace
+// is allowed so the trigger detector's trimmed span still matches.
+const BARE_POSTAL_CODE_RE =
+  /^\s*(?:\d{3}\s?\d{2}|\d{2}[-–]\d{3}|\d{5}(?:[-–]\d{3,4})?)\s*$/u;
 
 const hasCuratedLiteralBoundary = (entity: Entity): boolean =>
   LITERAL_SOURCES.has(entity.source) &&
@@ -122,6 +132,92 @@ const shouldReplace = (a: Entity, b: Entity): boolean => {
     bLen > aLen
   ) {
     return false;
+  }
+
+  // Postal-code inside a fuller address: when a longer same-label
+  // address span fully contains a shorter span whose text is just
+  // a bare postal code (Czech `160 00`, German `12345`, US `94304`
+  // or `94304-1050`), the shorter span is a fragment of the same
+  // data point. The longer span wins regardless of source priority.
+  // Bare postal-code text without surrounding street/city evidence
+  // is the only narrow case where containment beats the priority
+  // comparison; field-label trims (\`… IČ\`, \`… oddíl\`) and other
+  // address-vs-address comparisons stay on the standard path.
+  if (
+    a.label === "address" &&
+    b.label === "address" &&
+    a.start <= b.start &&
+    a.end >= b.end &&
+    aLen > bLen &&
+    BARE_POSTAL_CODE_RE.test(b.text)
+  ) {
+    return true;
+  }
+  if (
+    a.label === "address" &&
+    b.label === "address" &&
+    b.start <= a.start &&
+    b.end >= a.end &&
+    bLen > aLen &&
+    BARE_POSTAL_CODE_RE.test(a.text)
+  ) {
+    return false;
+  }
+
+  // Legal-form containment: a v2 legal-form entity span anchors on
+  // a suffix and grows back through CapWords + connectors, so its
+  // length DOES reliably indicate accuracy. When such a span fully
+  // contains a shorter same-label entity from a higher-priority
+  // detector (typically a trigger reclassifying a city name like
+  // `Prahy` inside `Technologie hlavního města Prahy, a. s.`), the
+  // legal-form span wins regardless of source priority.
+  if (
+    a.label === b.label &&
+    a.source === DETECTION_SOURCES.LEGAL_FORM &&
+    a.start <= b.start &&
+    a.end >= b.end &&
+    aLen > bLen
+  ) {
+    return true;
+  }
+  if (
+    a.label === b.label &&
+    b.source === DETECTION_SOURCES.LEGAL_FORM &&
+    b.start <= a.start &&
+    b.end >= a.end &&
+    bLen > aLen
+  ) {
+    return false;
+  }
+
+  // Same-start same-label longest-wins rule for shape-extending
+  // detectors. For labels where the entity naturally extends to
+  // include trailing context (a date that grows from `21.` to
+  // `21. März 1968`, a monetary amount that grows from `273,-`
+  // to `273,- Kč`), the longer span at the same offset is the
+  // correct boundary regardless of which detector emitted it.
+  // Without this rule the priority comparison below picks the
+  // shorter-but-higher-priority trigger and discards the full
+  // entity. The list is intentionally narrow — `address`,
+  // `organization`, `person` keep the priority semantics
+  // because their detectors don't have the same "trigger
+  // captures a prefix, regex captures the whole shape"
+  // relationship.
+  const LONGEST_WINS_LABELS: ReadonlySet<string> = new Set([
+    "date",
+    "date of birth",
+    "monetary amount",
+    "phone number",
+    "email address",
+    "url",
+  ]);
+  if (
+    a.label === b.label &&
+    a.start === b.start &&
+    aLen !== bLen &&
+    LONGEST_WINS_LABELS.has(a.label)
+  ) {
+    return aLen > bLen;
   }
 
   // Cross-label containment for country: a country token
@@ -347,6 +443,16 @@ const TRAILING_PUNCT_CLASS = `["“”‘’'»!?]`;
  * intentionally captured.
  */
 const LEADING_PUNCT_CLASS = `["“”‘’'«¿¡]`;
+const LEADING_ELLIPSIS_RE = /^(?:\.{2,}|…+)/u;
+const ELLIPSIS_PREFIX_LABELS: ReadonlySet<string> = new Set([
+  "date",
+  "date of birth",
+  "monetary amount",
+  "phone number",
+  "email address",
+  "url",
+  "time",
+]);
 const STRIP_BY_LABEL = {
   colon: /[\s,;]+/,
   default: /[\s:,;]+/,
@@ -385,7 +491,19 @@ export const sanitizeEntities = (entities: Entity[]): Entity[] =>
     // `"Some Org",` or ` "Name" ` collapse cleanly.
     const leadRe = LEADING_TRIM_BY_LABEL[stripKind];
     const trailRe = TRAILING_TRIM_BY_LABEL[stripKind];
-    const leadTrimmed = e.text.replace(leadRe, "");
+    // Sentence-tail ellipsis: a date or other shape-extending
+    // entity that sits at the end of a clause sometimes gets
+    // captured with the preceding `...` / `…` run still attached
+    // (`V Praze, dne ...2. 2. 2026` → `...2. 2. 2026`). The
+    // generic punctuation strip below doesn't touch them because
+    // the trailing dots aren't followed by whitespace. Strip the
+    // run explicitly for the labels that have this shape — numeric
+    // values where leading punctuation is never structurally part
+    // of the entity.
+    const ellipsisStripped = ELLIPSIS_PREFIX_LABELS.has(e.label)
+      ? e.text.replace(LEADING_ELLIPSIS_RE, "")
+      : e.text;
+    const leadTrimmed = ellipsisStripped.replace(leadRe, "");
     const lead = e.text.length - leadTrimmed.length;
     let cleaned = leadTrimmed.replace(trailRe, "");
     // Trailing-period strip for proper-noun labels that
@@ -579,6 +697,74 @@ const extendMonetaryAmountWords = (
       text: fullText.slice(e.start, newEnd),
     };
   });
+
+let monetaryTrailingCurrencyRe: RegExp | null = null;
+let monetaryTrailingCurrencyLoaded = false;
+
+type CurrenciesData = {
+  codes?: string[];
+  symbols?: string[];
+  localNames?: string[];
+};
+
+const getMonetaryTrailingCurrencyRe = async (): Promise<RegExp | null> => {
+  if (monetaryTrailingCurrencyLoaded) return monetaryTrailingCurrencyRe;
+  try {
+    const mod = await import("./data/currencies.json");
+    const data: CurrenciesData = mod.default ?? mod;
+    const codes = (data.codes ?? []).filter((c) => /^[A-Z]{2,4}$/.test(c));
+    const names = (data.localNames ?? []).filter((n) => n.length > 0);
+    const parts: string[] = [];
+    if (names.length > 0) {
+      parts.push(names.map(escapeRegex).join("|"));
+    }
+    if (codes.length > 0) {
+      parts.push(codes.map(escapeRegex).join("|"));
+    }
+    if (parts.length === 0) {
+      monetaryTrailingCurrencyRe = null;
+    } else {
+      const alt = parts.join("|");
+      monetaryTrailingCurrencyRe = new RegExp(
+        `^([^\\S\\n\\t]{0,4})(${alt})(?![\\p{L}\\p{N}])`,
+        "u",
+      );
+    }
+  } catch {
+    monetaryTrailingCurrencyRe = null;
+  }
+  monetaryTrailingCurrencyLoaded = true;
+  return monetaryTrailingCurrencyRe;
+};
+
+// Extend a monetary-amount entity to include a trailing currency
+// code/name when one sits within a short whitespace gap after the
+// captured span (`273,-` followed by `   Kč`, `1 000` followed by
+// ` CZK`). The unified regex backend occasionally drops the longer
+// currency pattern in favour of a shorter NUM-only match depending
+// on Rust regex DFA construction order; this post-process pass
+// re-attaches the suffix from \`currencies.json\` so the boundary
+// is the same regardless of which match resolved.
+const extendMonetaryTrailingCurrency = (
+  entities: Entity[],
+  fullText: string,
+  re: RegExp | null,
+): Entity[] => {
+  if (!re) return entities;
+  return entities.map((e) => {
+    if (e.label !== "monetary amount" || isCallerOwnedEntity(e)) return e;
+    if (/\p{L}/u.test(e.text.slice(-1) ?? "")) return e;
+    const after = fullText.slice(e.end);
+    const m = re.exec(after);
+    if (!m) return e;
+    const newEnd = e.end + m[0].length;
+    return {
+      ...e,
+      end: newEnd,
+      text: fullText.slice(e.start, newEnd),
+    };
+  });
+};
 
 type AllowedLabelSet = ReadonlySet<string> | null;
 
@@ -829,6 +1015,7 @@ export const runPipeline = async (
       });
     await Promise.all([
       loadGenericRoles(ctx),
+      loadDocumentStructureHeadings(),
       initPrepositions(),
       initStreetAbbrevs(),
       initAddressComponents(),
@@ -839,6 +1026,7 @@ export const runPipeline = async (
   } else {
     await Promise.all([
       loadGenericRoles(ctx),
+      loadDocumentStructureHeadings(),
       initPrepositions(),
       initStreetAbbrevs(),
       initAddressComponents(),
@@ -934,12 +1122,7 @@ export const runPipeline = async (
     await warmLegalRoleHeads();
   }
   const rawLegalFormEntities = legalFormsEnabled
-    ? processLegalFormMatches(
-        regexMatches,
-        slices.legalForms.start,
-        slices.legalForms.end,
-        fullText,
-      )
+    ? detectLegalFormsV2(fullText)
     : [];
   const legalFormEntities = filterAllowedLabels(
     rawLegalFormEntities,
@@ -1209,8 +1392,14 @@ export const runPipeline = async (
   // preventing duplicate extensions from clobbering
   // unrelated entities between e.end and newEnd.
   const monetaryAmountWordsRe = await getAmountWordsRe();
-  const mergedExtended = extendMonetaryAmountWords(
+  const monetaryTrailingRe = await getMonetaryTrailingCurrencyRe();
+  const mergedWithCurrency = extendMonetaryTrailingCurrency(
     rawMerged,
+    fullText,
+    monetaryTrailingRe,
+  );
+  const mergedExtended = extendMonetaryAmountWords(
+    mergedWithCurrency,
     fullText,
     monetaryAmountWordsRe,
   );

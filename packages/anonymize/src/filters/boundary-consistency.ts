@@ -201,6 +201,15 @@ const mergeAdjacent = (entities: Entity[], fullText: string): Entity[] => {
       }
     }
 
+    // Touching entities (entity.start === prev.end) leave a zero-
+    // length gap that GAP_PATTERN's `+` quantifier refuses to match;
+    // the two would stay split even though they sit flush against
+    // each other. `cs-address-psc` emits a leading-space variant of
+    // the postal code that ends up flush with the preceding street
+    // address (`Kamínky 302/16, Brno` + ` 634 00`); treat them as
+    // mergeable.
+    const isMergeableGap =
+      gap.length === 0 || (gap.length <= MAX_GAP && GAP_PATTERN.test(gap));
     if (
       !hasLockedBoundary(prev) &&
       !(
@@ -222,8 +231,7 @@ const mergeAdjacent = (entities: Entity[], fullText: string): Entity[] => {
       // Mexico" must stay three distinct spans, not one.
       entity.label !== "country" &&
       !gapOccupied &&
-      gap.length <= MAX_GAP &&
-      GAP_PATTERN.test(gap)
+      isMergeableGap
     ) {
       // Merge into prev
       prev.end = entity.end;
@@ -264,6 +272,17 @@ const fixPartialWords = (entities: Entity[], fullText: string): Entity[] => {
 
   return sorted.map((e, eIdx) => {
     if (hasLockedBoundary(e)) {
+      return e;
+    }
+    // The entity's stored `text` is its source-of-truth display;
+    // an upstream collapse pass (e.g. monetary `273,-   Kč` →
+    // `273,- Kč`) intentionally divorces `text` from
+    // `fullText.slice(start, end)`. Letting `wordStartAt`/`wordEndAt`
+    // recompute the span here would overwrite the entity text with
+    // the raw slice and lose the collapsed-out characters. Treat
+    // such entities as having locked boundaries — their detector
+    // already chose the right span.
+    if (e.text !== fullText.slice(e.start, e.end)) {
       return e;
     }
 
