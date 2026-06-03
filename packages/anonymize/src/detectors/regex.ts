@@ -7,6 +7,7 @@ import {
   bg,
   br,
   ch,
+  cn,
   cz,
   cy,
   de,
@@ -338,6 +339,40 @@ const STDNUM_ENTRIES: readonly StdnumEntry[] = [
   // overlap resolver prefers the tax-ID label.
   toEntry(br.cpf, "tax identification number", 0.95),
   toEntry(br.cnpj, "tax identification number", 0.95),
+
+  // ── CN validators ────────────────────────────────
+  // RIC (Resident Identity Card, 18-digit modern form:
+  // region + YYYYMMDD + sequence + MOD 11-2 check digit,
+  // last position may be `X`). The pattern is tightened
+  // to a digit-only `\d{17}[\dX]` shape so it can't
+  // match alphanumeric blobs that share the length
+  // bucket; the validator then enforces the embedded
+  // birth date and the checksum.
+  //
+  // The legacy 15-digit form is NOT covered: its bare
+  // `\d{15}` shape is shadowed by the `fr.nir` pattern
+  // (also 15 digits) in the unified text-search engine,
+  // which returns only one match per position and picks
+  // the earlier-registered pattern. The modern 18-digit
+  // form has dominated CN issuance since 1999, so the
+  // gap is theoretical for current corpora.
+  // Lookbehind/lookahead use an ASCII identifier class rather than
+  // `\w`: the text-search regex backend treats `\w` as Unicode word
+  // chars, which would have CJK label prefixes (`身份证号120…`) satisfy
+  // the negative boundary and block matches in native-language
+  // contexts. Restricting the boundary to ASCII identifier chars
+  // still rejects the cases the boundary exists for — order/account
+  // numbers (`Order 1201…`, `ID-1201…`).
+  //
+  // The check-digit class accepts both `X` and `x`: real-world IDs
+  // are commonly written with the lowercase variant, and the stdnum
+  // validator's compact step normalises the case before checksum.
+  {
+    validator: cn.ric,
+    label: "national identification number",
+    score: 0.95,
+    pattern: "(?<![A-Za-z0-9_])\\d{17}[\\dXx](?![A-Za-z0-9_])",
+  },
 ].filter((e): e is StdnumEntry => e !== null);
 
 // ── Named pattern definitions ────────────────────────
