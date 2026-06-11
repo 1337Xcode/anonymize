@@ -10,7 +10,7 @@ import type {
   RedactionResult,
 } from "./types";
 import type { PipelineContext } from "./context";
-import { corefKey, defaultContext } from "./context";
+import { defaultContext } from "./context";
 
 const WHITESPACE_RE = /\s+/g;
 const PHONE_NOISE_RE = /[()\s-]/g;
@@ -72,14 +72,13 @@ const normalizeEntityText = (label: string, text: string): string => {
  * Placeholder format: [LABEL_N] where LABEL is uppercase
  * and N is a 1-based counter per label.
  *
- * @param ctx Pipeline context. Must be the same instance
- *   passed to `runPipeline` (or `findCoreferenceSpans`)
- *   so coreference placeholder links are preserved.
- *   Defaults to `defaultContext` for single-tenant usage.
+ * @param _ctx Unused. Kept for signature compatibility;
+ *   coref alias links now travel on the entities
+ *   themselves (`corefSourceText`).
  */
 export const buildPlaceholderMap = (
   entities: Entity[],
-  ctx: PipelineContext = defaultContext,
+  _ctx: PipelineContext = defaultContext,
 ): Map<string, string> => {
   const counters = new Map<string, number>();
   const textLabelToPlaceholder = new Map<string, string>();
@@ -95,13 +94,22 @@ export const buildPlaceholderMap = (
 
     const labelKey = entity.label.toUpperCase().replace(WHITESPACE_RE, "_");
 
-    // Coreference side-channel: if this entity is a
-    // coref alias, look up the source entity's
-    // placeholder so both get the same number.
-    const sourceText = ctx.corefSourceMap.get(corefKey(entity));
-    if (sourceText !== undefined) {
-      const sourceNormalized = normalizeEntityText(entity.label, sourceText);
-      const sourceNormalizedKey = `${labelKey}\0${sourceNormalized}`;
+    // If this entity is a coref alias, unify its key
+    // with the source entity's key so both get the same
+    // number — in either direction: a backward alias
+    // joins the source's existing placeholder, and a
+    // forward alias (bare mention before the full form)
+    // reserves its placeholder under the source key so
+    // the source joins it when numbered later. The link
+    // is carried on the entity itself, so it cannot be
+    // lost between detection and redaction.
+    const sourceText =
+      entity.source === "coreference" ? entity.corefSourceText : undefined;
+    const sourceNormalizedKey =
+      sourceText === undefined
+        ? undefined
+        : `${labelKey}\0${normalizeEntityText(entity.label, sourceText)}`;
+    if (sourceNormalizedKey !== undefined) {
       const sourceExisting = normalizedToPlaceholder.get(sourceNormalizedKey);
       if (sourceExisting) {
         textLabelToPlaceholder.set(compositeKey, sourceExisting);
@@ -114,6 +122,9 @@ export const buildPlaceholderMap = (
     const existing = normalizedToPlaceholder.get(normalizedKey);
     if (existing) {
       textLabelToPlaceholder.set(compositeKey, existing);
+      if (sourceNormalizedKey !== undefined) {
+        normalizedToPlaceholder.set(sourceNormalizedKey, existing);
+      }
       continue;
     }
 
@@ -123,6 +134,9 @@ export const buildPlaceholderMap = (
     const placeholder = `[${labelKey}_${count}]`;
     textLabelToPlaceholder.set(compositeKey, placeholder);
     normalizedToPlaceholder.set(normalizedKey, placeholder);
+    if (sourceNormalizedKey !== undefined) {
+      normalizedToPlaceholder.set(sourceNormalizedKey, placeholder);
+    }
   }
 
   return textLabelToPlaceholder;
@@ -201,12 +215,19 @@ export const redactText = (
     // iterates redactionMap (replace entries only).
     operatorMap.set(placeholder, opType);
 
-    // Only populate redactionMap for reversible operators
+    // Only populate redactionMap for reversible operators.
+    // A coref alias contributes its source's full text, so
+    // a forward alias ("Acme" before "Acme Corporation")
+    // cannot pin the shortened surface form as the key's
+    // canonical value for the shared placeholder.
     if (
       operator.reversibility === "reversible" &&
       !redactionMap.has(placeholder)
     ) {
-      redactionMap.set(placeholder, entity.text);
+      redactionMap.set(
+        placeholder,
+        entity.source === "coreference" ? entity.corefSourceText : entity.text,
+      );
     }
 
     cursor = entity.end;
