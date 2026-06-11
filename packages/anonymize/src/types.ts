@@ -314,6 +314,13 @@ export type Dictionaries = {
    */
   surnames?: Readonly<Record<string, readonly string[]>>;
   /**
+   * Non-Western name tokens per locale code
+   * (e.g., "in", "ar", "ja-latn", "ko", "zh-latn",
+   * "th", "vi", "fil", "id"). Merged with bundled
+   * names-nw-*.json data at init time.
+   */
+  nonWesternNames?: Readonly<Record<string, readonly string[]>>;
+  /**
    * Pre-loaded deny-list dictionaries keyed by
    * dictionary ID (e.g., "courts/CZ", "banks/DE").
    * Each value is the array of terms for that

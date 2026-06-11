@@ -97,7 +97,13 @@ export {
   findCoreferenceSpans,
 } from "./detectors/coreference";
 export { propagateOrgNames } from "./detectors/org-propagation";
-export { detectNameCorpus, initNameCorpus } from "./detectors/names";
+export {
+  detectNameCorpus,
+  initNameCorpus,
+  getNameCorpusNonWesternNames,
+} from "./detectors/names";
+/** @deprecated Use detectNameCorpus instead */
+export { detectNonWesternNames } from "./detectors/locale-name-detector";
 
 // ── Deny List Detector ──────────────────────────
 export {

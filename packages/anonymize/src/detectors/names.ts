@@ -2,6 +2,11 @@ import { DETECTION_SOURCES } from "../types";
 import type { Dictionaries, Entity } from "../types";
 import type { PipelineContext, NameCorpusData } from "../context";
 import { defaultContext } from "../context";
+import {
+  HONORIFIC_ABBREVIATION,
+  NONWESTERN_HONORIFICS,
+  TITLE_PREFIXES,
+} from "../config/titles";
 import { ALL_UPPER_RE, UPPER_START_RE, isSentenceStart } from "../util/text";
 
 // ── Name corpus ──────────────────────────────────────
@@ -28,6 +33,9 @@ export const getNameCorpusTitles = (
 export const getNameCorpusExcluded = (
   ctx: PipelineContext = defaultContext,
 ): readonly string[] => ctx.nameCorpus?.excludedList ?? [];
+export const getNameCorpusNonWesternNames = (
+  ctx: PipelineContext = defaultContext,
+): readonly string[] => ctx.nameCorpus?.nonWesternNamesList ?? [];
 
 /**
  * Load name corpus data from injected dictionaries
@@ -132,18 +140,99 @@ export const initNameCorpus = (
       const dedupSurnames = dedup(surnames).filter(
         (name) => !commonWords.has(name.toLowerCase()),
       );
-      const titles = titleMod.default.tokens;
+
+      // Merge non-Western honorifics into title tokens.
+      // Strip trailing dots/dashes and lowercase so they
+      // match the lowercased form used in classifyToken.
+      const titles = [...titleMod.default.tokens];
+      for (const form of Object.values(NONWESTERN_HONORIFICS).flat()) {
+        titles.push(form.replace(/[.-]+$/u, "").toLowerCase());
+      }
+      const dedupTitles = dedup(titles);
+
+      // Build abbreviation-style title set: titles whose
+      // trailing dot is part of the abbreviation, not a
+      // sentence boundary. Used by chain assembly to avoid
+      // breaking chains on "Dr. Smith", "Smt. Irani", etc.
+      const titleAbbrSet = new Set<string>();
+      // Western titles with trailing dots (Ing., Dr., etc.)
+      for (const prefix of TITLE_PREFIXES) {
+        if (prefix.endsWith(".")) {
+          titleAbbrSet.add(prefix.replace(/[.-]+$/u, "").toLowerCase());
+        }
+      }
+      // Explicit abbreviation honorifics (Mr, Ms, etc.)
+      for (const form of HONORIFIC_ABBREVIATION) {
+        titleAbbrSet.add(form.replace(/[.-]+$/u, "").toLowerCase());
+      }
+      // Non-Western honorifics with dotted forms (Smt., Pt., Adv., etc.)
+      for (const form of Object.values(NONWESTERN_HONORIFICS).flat()) {
+        if (form.endsWith(".")) {
+          titleAbbrSet.add(form.replace(/[.-]+$/u, "").toLowerCase());
+        }
+      }
+
       const exclusions = exclusionMod.default.words;
+
+      // ── Load non-Western name tokens ────────────────
+      // Per-locale JSON files + optional injected data.
+      // Always load all locales (small files); the
+      // language-scoping config uses different keys.
+      const nwLocaleKeys = [
+        "in",
+        "ar",
+        "ja-latn",
+        "ko",
+        "zh-latn",
+        "th",
+        "vi",
+        "fil",
+        "id",
+      ] as const;
+      const [nwNameMods, nwExcludedMod] = await Promise.all([
+        Promise.all(
+          nwLocaleKeys.map(
+            (locale) =>
+              import(`../data/names-nw-${locale}.json`) as Promise<{
+                default: { names: string[] };
+              }>,
+          ),
+        ),
+        import("../data/names-nw-excluded-allcaps.json") as Promise<{
+          default: { words: string[] };
+        }>,
+      ]);
+
+      const nonWesternNames: string[] = [];
+      for (const mod of nwNameMods) {
+        for (const name of mod.default.names) {
+          nonWesternNames.push(name);
+        }
+      }
+      if (dictionaries?.nonWesternNames) {
+        for (const [, names] of Object.entries(dictionaries.nonWesternNames)) {
+          for (const name of names) {
+            nonWesternNames.push(name);
+          }
+        }
+      }
+      const dedupNonWestern = dedup(nonWesternNames);
+      const dedupExcludedAllCaps = dedup(nwExcludedMod.default.words);
 
       ctx.nameCorpus = {
         firstNames: Object.freeze(new Set(dedupFirst)),
         surnames: Object.freeze(new Set(dedupSurnames)),
-        titleTokens: Object.freeze(new Set(titles)),
+        titleTokens: Object.freeze(new Set(dedupTitles)),
+        titleAbbreviations: Object.freeze(titleAbbrSet),
         excludedWords: Object.freeze(new Set(exclusions)),
+        nonWesternNames: Object.freeze(new Set(dedupNonWestern)),
+        excludedAllCaps: Object.freeze(new Set(dedupExcludedAllCaps)),
         firstNamesList: Object.freeze(dedupFirst),
         surnamesList: Object.freeze(dedupSurnames),
-        titlesList: Object.freeze(titles),
+        titlesList: Object.freeze(dedupTitles),
         excludedList: Object.freeze(exclusions),
+        nonWesternNamesList: Object.freeze(dedupNonWestern),
+        excludedAllCapsList: Object.freeze(dedupExcludedAllCaps),
       };
     } catch (err) {
       // Reset so the next call retries the load rather
@@ -332,6 +421,8 @@ const TOKEN_TYPE = {
   SURNAME: "surname",
   TITLE: "title",
   ABBREVIATION: "abbreviation",
+  JA_SUFFIX: "ja_suffix",
+  ARABIC_CONNECTOR: "arabic_connector",
   CAPITALIZED: "capitalized",
   OTHER: "other",
 } as const;
@@ -343,6 +434,11 @@ type ClassifiedToken = {
   type: TokenType;
   start: number;
   end: number;
+  /** True when matched via nonWesternNames corpus. */
+  nonWestern?: boolean;
+  /** True when this is an abbreviation-style title (Dr, Mr, Smt, etc.)
+   *  whose trailing dot is not a sentence boundary. */
+  titleAbbreviation?: boolean;
 };
 
 const PERSON_CHAIN_BREAK_RE = /[!?;:]/u;
@@ -381,6 +477,69 @@ const isSurnameToken = (token: string, corpus: NameCorpusData): boolean => {
  */
 const isAbbreviation = (token: string): boolean =>
   token.length === 2 && /^\p{Lu}$/u.test(token[0] ?? "") && token[1] === ".";
+
+/**
+ * Title-case a token, re-capitalizing after apostrophes
+ * so D'Souza, O'Brien, Hon'ble match the corpus.
+ */
+const titleCaseWithApostrophe = (text: string): string =>
+  (text[0]?.toUpperCase() ?? "") +
+  text
+    .slice(1)
+    .toLowerCase()
+    .replace(/'\p{Ll}/gu, (m) => m.toUpperCase());
+
+/**
+ * Check if a token is in the non-Western name corpus.
+ * Tries both title-cased (with apostrophe re-cap) and
+ * raw forms.
+ */
+const isNonWesternNameToken = (
+  token: string,
+  corpus: NameCorpusData,
+): boolean => {
+  if (corpus.nonWesternNames.has(token)) return true;
+  return corpus.nonWesternNames.has(titleCaseWithApostrophe(token));
+};
+
+// ── Non-Western pattern helpers ─────────────────────
+
+/** Japanese honorific suffixes attached via hyphen. */
+const JA_SUFFIXES = new Set(["san", "sama", "sensei"]);
+
+/** Arabic patronymic connectors. */
+const ARABIC_CONNECTORS = new Set(["bin", "bint", "ibn", "al", "el"]);
+
+/** Al-/El- prefixed name pattern (e.g., Al-Rashid, El-Amin). */
+const AL_EL_PREFIX_RE = /^[Aa]l-[A-Z][a-z]+$|^[Ee]l-[A-Z][a-z]+$/u;
+
+/** CJK name detection: 2-4 Han chars not adjacent to others. */
+const CJK_NAME_RE =
+  /(?<!\p{Script=Han})\p{Script=Han}{2,4}(?!\p{Script=Han})/gu;
+
+/** Han character threshold for CJK-majority documents. */
+const CJK_HAN_RATIO = 0.15;
+
+/** Organization keyword filter. */
+const ORG_WORDS =
+  /\b(?:Group|Company|LLC|LLP|LP|Inc|Ltd|Corp|Corporation|Holdings|Partners|Association|University|Bank|Fund|Trust|Agency|Government|Ministry|Office|Department|Council|Board|Committee|Commission|Services|Solutions|Technologies|Systems|Analytics|Software)\b/i;
+
+const isOrganization = (text: string): boolean => ORG_WORDS.test(text);
+
+/** Deduplicate overlapping entity spans (first wins). */
+const deduplicateSpans = (entities: Entity[]): Entity[] => {
+  const sorted = [...entities].sort(
+    (a, b) => a.start - b.start || b.end - a.end,
+  );
+  const result: Entity[] = [];
+  for (const entity of sorted) {
+    const last = result.at(-1);
+    if (!last || entity.start >= last.end) {
+      result.push(entity);
+    }
+  }
+  return result;
+};
 
 // ── Word segmentation ────────────────────────────────
 
@@ -482,10 +641,38 @@ const classifyToken = (
   // Strip trailing period for title check (e.g., "Ing.")
   const stripped = text.endsWith(".") ? text.slice(0, -1).toLowerCase() : lower;
 
+  // 1. Title tokens (Western + non-Western honorifics)
   if (corpus.titleTokens.has(stripped)) {
-    return { text, type: TOKEN_TYPE.TITLE, start, end };
+    // Mark abbreviation-style titles so the chain
+    // assembler knows their trailing dot is not a
+    // sentence boundary (Dr., Mr., Smt. etc.).
+    return {
+      text,
+      type: TOKEN_TYPE.TITLE,
+      start,
+      end,
+      ...(corpus.titleAbbreviations.has(stripped)
+        ? { titleAbbreviation: true }
+        : {}),
+    };
   }
 
+  // 2. Japanese honorific suffixes (san, sama, sensei)
+  if (JA_SUFFIXES.has(lower)) {
+    return { text, type: TOKEN_TYPE.JA_SUFFIX, start, end };
+  }
+
+  // 3. Arabic patronymic connectors (bin, bint, ibn, al, el)
+  if (ARABIC_CONNECTORS.has(lower)) {
+    return { text, type: TOKEN_TYPE.ARABIC_CONNECTOR, start, end };
+  }
+
+  // 4. Al-/El- prefixed name pattern (Al-Rashid, El-Amin)
+  if (AL_EL_PREFIX_RE.test(text)) {
+    return { text, type: TOKEN_TYPE.NAME, start, end, nonWestern: true };
+  }
+
+  // 5. Abbreviation (initials like "R.", "M.")
   if (isAbbreviation(text)) {
     return {
       text,
@@ -493,6 +680,11 @@ const classifyToken = (
       start,
       end,
     };
+  }
+
+  // 5b. Multi-dot abbreviation patterns (A.P.J, K.C.R)
+  if (/^(?:\p{Lu}\.)+\p{Lu}?$/u.test(text)) {
+    return { text, type: TOKEN_TYPE.ABBREVIATION, start, end };
   }
 
   // `Intl.Segmenter` splits middle initials into a
@@ -506,23 +698,35 @@ const classifyToken = (
   //
   // Standalone enumerators ("A. Definitions",
   // "Section R. Adam") look identical to middle
-  // initials at the token level. Distinguish by the
-  // previous word on the same line: a middle initial
-  // is always preceded by a name-corpus first name,
-  // so only classify as ABBREVIATION when that
-  // structural context is present.
+  // initials at the token level. Distinguish by
+  // structural context: a middle initial is preceded by
+  // a name-corpus first name, OR followed by another
+  // name token (covering "R. K. Narayan" where "R"
+  // starts the name but is followed by "K.").
   if (text.length === 1 && UPPER_START_RE.test(text) && fullText[end] === ".") {
     const lineStart = fullText.lastIndexOf("\n", start - 1) + 1;
     const before = fullText.slice(lineStart, start).trimEnd();
     const lastWord = /\p{L}[\p{L}\p{M}'-]*$/u.exec(before)?.[0];
-    if (lastWord) {
-      const lookup = (token: string): boolean =>
-        isFirstNameToken(token, corpus) ||
-        isFirstNameToken(
-          (token[0] ?? "") + token.slice(1).toLowerCase(),
-          corpus,
-        );
-      if (lookup(lastWord)) {
+    const lookup = (token: string): boolean =>
+      isFirstNameToken(token, corpus) ||
+      isFirstNameToken(
+        (token[0] ?? "") + token.slice(1).toLowerCase(),
+        corpus,
+      ) ||
+      isNonWesternNameToken(token, corpus);
+    // Check preceding context (middle initial after a name)
+    if (lastWord && lookup(lastWord)) {
+      return { text, type: TOKEN_TYPE.ABBREVIATION, start, end };
+    }
+    // Check following context (initial before a name or
+    // another initial, e.g., "R. K. Narayan")
+    const afterDot = fullText.slice(end + 1).trimStart();
+    const nextWord = /^\p{L}[\p{L}\p{M}'-]*/u.exec(afterDot)?.[0];
+    if (nextWord) {
+      const isNextName =
+        lookup(nextWord) ||
+        (nextWord.length === 1 && UPPER_START_RE.test(nextWord));
+      if (isNextName) {
         return { text, type: TOKEN_TYPE.ABBREVIATION, start, end };
       }
     }
@@ -534,31 +738,78 @@ const classifyToken = (
     return { text, type: TOKEN_TYPE.OTHER, start, end };
   }
 
-  // Minimum length 3
-  if (text.length < 3) {
+  // Minimum length 3 for Western corpus matching, but
+  // allow 2-char tokens that match the non-Western name
+  // corpus (e.g., "Yi", "Li", "Vo"), are Arabic
+  // connectors / Japanese suffixes already classified,
+  // or are short all-caps post-nominals not in the
+  // excluded-all-caps set (e.g., "JP", "KC", "QC").
+  if (text.length < 2) {
+    return { text, type: TOKEN_TYPE.OTHER, start, end };
+  }
+  if (
+    text.length < 3 &&
+    !isNonWesternNameToken(text, corpus) &&
+    !JA_SUFFIXES.has(lower) &&
+    !ARABIC_CONNECTORS.has(lower) &&
+    !(ALL_UPPER_RE.test(text) && !corpus.excludedAllCaps.has(text))
+  ) {
     return { text, type: TOKEN_TYPE.OTHER, start, end };
   }
 
   // All-uppercase tokens >= 3 chars are usually
-  // acronyms, but in a signature or title block they are
-  // real names rendered in caps ("ELON R. MUSK", "JAN
-  // NOVÁK"). Allow the corpus lookup in title-case only
-  // when (a) the line itself is overwhelmingly upper-
-  // case and (b) the line looks name-shaped — few
-  // tokens, no digits — so all-caps disclosure prose
-  // such as "SERVICE MARK LICENSE" doesn't surface
-  // "MARK" as a person via the corpus.
+  // acronyms, but there are two legitimate name contexts:
+  //
+  // 1. Signature/title blocks: "ELON R. MUSK", "JAN
+  //    NOVÁK" — allowed when the line is overwhelmingly
+  //    upper-case and looks name-shaped.
+  // 2. Non-Western family-name-first convention: "SATO
+  //    Kenji", "PARK Jihoon" — the surname is written in
+  //    ALL CAPS with the given name in title case. This is
+  //    valid even in mixed-case text, so we check the
+  //    non-Western corpus without requiring an all-caps
+  //    line context.
   if (text.length >= 3 && ALL_UPPER_RE.test(text)) {
+    // Exclude common all-caps acronyms
+    if (corpus.excludedAllCaps.has(text)) {
+      return { text, type: TOKEN_TYPE.OTHER, start, end };
+    }
+    const titleCased = (text[0] ?? "") + text.slice(1).toLowerCase();
+    const nwMatch = isNonWesternNameToken(titleCased, corpus);
+
+    // Non-Western all-caps surname pattern (SATO, PARK,
+    // KIM, etc.) — valid without all-caps line context
+    if (nwMatch && !isFirstNameToken(titleCased, corpus)) {
+      return { text, type: TOKEN_TYPE.NAME, start, end, nonWestern: true };
+    }
+
+    // Signature/title block all-caps recovery path
     if (
       isAllCapsContextLine(fullText, start) &&
       isAllCapsLineNameShaped(fullText, start)
     ) {
-      const titleCased = (text[0] ?? "") + text.slice(1).toLowerCase();
       if (isFirstNameToken(titleCased, corpus)) {
-        return { text, type: TOKEN_TYPE.NAME, start, end };
+        return {
+          text,
+          type: TOKEN_TYPE.NAME,
+          start,
+          end,
+          ...(nwMatch ? { nonWestern: true } : {}),
+        };
       }
       if (isSurnameToken(titleCased, corpus)) {
-        return { text, type: TOKEN_TYPE.SURNAME, start, end };
+        return {
+          text,
+          type: TOKEN_TYPE.SURNAME,
+          start,
+          end,
+          ...(nwMatch ? { nonWestern: true } : {}),
+        };
+      }
+      // Non-Western corpus match only (not in Western
+      // corpus) in all-caps name-shaped line
+      if (nwMatch) {
+        return { text, type: TOKEN_TYPE.NAME, start, end, nonWestern: true };
       }
     }
     return { text, type: TOKEN_TYPE.OTHER, start, end };
@@ -570,11 +821,33 @@ const classifyToken = (
   }
 
   if (isFirstNameToken(text, corpus)) {
-    return { text, type: TOKEN_TYPE.NAME, start, end };
+    // Also flag as non-Western if matched by both corpora
+    const nw = isNonWesternNameToken(text, corpus);
+    return {
+      text,
+      type: TOKEN_TYPE.NAME,
+      start,
+      end,
+      ...(nw ? { nonWestern: true } : {}),
+    };
   }
 
   if (isSurnameToken(text, corpus)) {
-    return { text, type: TOKEN_TYPE.SURNAME, start, end };
+    const nw = isNonWesternNameToken(text, corpus);
+    return {
+      text,
+      type: TOKEN_TYPE.SURNAME,
+      start,
+      end,
+      ...(nw ? { nonWestern: true } : {}),
+    };
+  }
+
+  // Non-Western name corpus check (after Western
+  // corpus, so a token in both gets type NAME/SURNAME
+  // with nonWestern flag rather than type NAME alone).
+  if (isNonWesternNameToken(text, corpus)) {
+    return { text, type: TOKEN_TYPE.NAME, start, end, nonWestern: true };
   }
 
   // Capitalised word (not in corpus but starts uppercase)
@@ -591,11 +864,12 @@ const classifyToken = (
 /**
  * Detect person names by looking up tokens against the
  * name corpus, then chaining adjacent name-like tokens.
+ * Handles both Western and non-Western name patterns.
  *
  * Requires initNameCorpus() to have been called first.
  * If not initialized, returns an empty array.
  *
- * Scoring:
+ * Scoring (Western):
  *   TITLE + NAME/SURNAME       → 0.95
  *   NAME + NAME/SURNAME        → 0.9
  *   SURNAME + NAME/SURNAME     → 0.9
@@ -603,6 +877,14 @@ const classifyToken = (
  *   ABBREVIATION + NAME        → 0.7
  *   Standalone NAME            → 0.5 (low confidence)
  *   Standalone SURNAME         → skip (too ambiguous)
+ *
+ * Scoring (non-Western, when chain contains nonWestern tokens):
+ *   TITLE + (nonWestern|CAPITALIZED) → 0.95
+ *   JA_SUFFIX + (CAPITALIZED|nonWestern) → 0.9
+ *   ARABIC_CONNECTOR + nonWestern     → 0.9
+ *   2+ nonWestern tokens              → 0.9
+ *   nonWestern + (CAPITALIZED|ABBREVIATION) → 0.9
+ *   Standalone nonWestern mid-sentence → 0.5
  */
 export const detectNameCorpus = (
   fullText: string,
@@ -613,9 +895,67 @@ export const detectNameCorpus = (
     return [];
   }
 
-  const words = segmentWords(fullText);
-  const tokens = words.map((w) => classifyToken(w, corpus, fullText));
   const entities: Entity[] = [];
+
+  // ── CJK pre-pass ─────────────────────────────────
+  // Only detect CJK names in Latin-majority documents
+  // (CJK-majority text has too many Han characters for
+  // this heuristic to be useful).
+  const threshold = Math.ceil(fullText.length * CJK_HAN_RATIO);
+  let hanCount = 0;
+  for (const _ of fullText.matchAll(/\p{Script=Han}/gu)) {
+    hanCount++;
+    if (hanCount >= threshold) break;
+  }
+  const isLatinMajority = fullText.length < 100 || hanCount < threshold;
+  if (isLatinMajority) {
+    CJK_NAME_RE.lastIndex = 0;
+    let match: RegExpExecArray | null;
+    while ((match = CJK_NAME_RE.exec(fullText)) !== null) {
+      const cjkText = match[0];
+      if (!isOrganization(cjkText)) {
+        entities.push({
+          start: match.index,
+          end: match.index + cjkText.length,
+          label: "person",
+          text: cjkText,
+          score: 0.95,
+          source: DETECTION_SOURCES.REGEX,
+        });
+      }
+    }
+  }
+
+  // ── Token-based detection ────────────────────────
+  const words = segmentWords(fullText);
+
+  // Convert word segments to classified tokens,
+  // handling s/o, d/o, w/o, r/o relational connectors
+  // as single ARABIC_CONNECTOR tokens.
+  const tokens: ClassifiedToken[] = [];
+  for (let idx = 0; idx < words.length; idx++) {
+    const word = words[idx]!;
+    const lower = word.text.toLowerCase();
+    const nextWord = words[idx + 1];
+    if (
+      (lower === "s" || lower === "d" || lower === "w" || lower === "r") &&
+      fullText[word.end] === "/" &&
+      nextWord &&
+      nextWord.start === word.end + 1 &&
+      nextWord.text.toLowerCase() === "o"
+    ) {
+      tokens.push({
+        text: fullText.slice(word.start, word.end + 2),
+        type: TOKEN_TYPE.ARABIC_CONNECTOR,
+        start: word.start,
+        end: word.end + 2,
+      });
+      idx++;
+    } else {
+      tokens.push(classifyToken(word, corpus, fullText));
+    }
+  }
+
   const consumed = new Set<number>();
 
   for (let i = 0; i < tokens.length; i++) {
@@ -629,12 +969,14 @@ export const detectNameCorpus = (
     }
 
     // Only start chains from TITLE, NAME, SURNAME,
-    // or ABBREVIATION
+    // ABBREVIATION, or ARABIC_CONNECTOR (JA_SUFFIX
+    // alone is not a valid chain start)
     if (
       token.type !== TOKEN_TYPE.TITLE &&
       token.type !== TOKEN_TYPE.NAME &&
       token.type !== TOKEN_TYPE.SURNAME &&
-      token.type !== TOKEN_TYPE.ABBREVIATION
+      token.type !== TOKEN_TYPE.ABBREVIATION &&
+      token.type !== TOKEN_TYPE.ARABIC_CONNECTOR
     ) {
       continue;
     }
@@ -656,8 +998,22 @@ export const detectNameCorpus = (
       const prev = chain.at(-1);
       if (prev) {
         const gap = fullText.slice(prev.end, next.start);
+        // A period in the gap breaks the chain, unless:
+        // 1. The gap looks like an initial continuation
+        //    (e.g., "R." between two initials).
+        // 2. The previous token is an abbreviation-style
+        //    title (Dr., Mr., Smt.) whose trailing dot is
+        //    part of the abbreviation, not a sentence end.
+        // 3. The previous token is an abbreviation (R., K.,
+        //    A.P.J.) whose trailing dot is part of the
+        //    abbreviation.
+        const periodIsPartOfPrevToken =
+          prev.type === TOKEN_TYPE.ABBREVIATION ||
+          (prev.type === TOKEN_TYPE.TITLE && prev.titleAbbreviation === true);
         const breaksOnPeriod =
-          gap.includes(".") && !isInitialContinuationGap(prev.text, gap);
+          gap.includes(".") &&
+          !isInitialContinuationGap(prev.text, gap) &&
+          !periodIsPartOfPrevToken;
         if (
           gap.includes("\n") ||
           PERSON_CHAIN_BREAK_RE.test(gap) ||
@@ -665,17 +1021,20 @@ export const detectNameCorpus = (
         ) {
           break;
         }
+        // Japanese suffixes only attach via hyphen or
+        // whitespace (no other gap allowed)
+        if (
+          next.type === TOKEN_TYPE.JA_SUFFIX &&
+          gap !== "-" &&
+          gap.trim() !== ""
+        ) {
+          break;
+        }
       }
 
-      // Only chain NAME, SURNAME, TITLE, ABBREVIATION,
-      // CAPITALIZED
-      if (
-        next.type === TOKEN_TYPE.NAME ||
-        next.type === TOKEN_TYPE.SURNAME ||
-        next.type === TOKEN_TYPE.TITLE ||
-        next.type === TOKEN_TYPE.ABBREVIATION ||
-        next.type === TOKEN_TYPE.CAPITALIZED
-      ) {
+      // Chain NAME, SURNAME, TITLE, ABBREVIATION,
+      // CAPITALIZED, JA_SUFFIX, ARABIC_CONNECTOR
+      if (next.type !== TOKEN_TYPE.OTHER) {
         chain.push(next);
         j++;
       } else {
@@ -690,60 +1049,102 @@ export const detectNameCorpus = (
     const hasAbbreviation = chain.some(
       (t) => t.type === TOKEN_TYPE.ABBREVIATION,
     );
+    const hasNonWestern = chain.some((t) => t.nonWestern === true);
+    const hasJaSuffix = chain.some((t) => t.type === TOKEN_TYPE.JA_SUFFIX);
+    const hasArabicConnector = chain.some(
+      (t) => t.type === TOKEN_TYPE.ARABIC_CONNECTOR,
+    );
     const corpusCount = chain.filter((t) => isCorpusMatch(t.type)).length;
     const capitalizedCount = chain.filter(
       (t) => t.type === TOKEN_TYPE.CAPITALIZED,
     ).length;
+    const nonWesternCount = chain.filter((t) => t.nonWestern).length;
 
     // Determine score based on chain composition
     let score: number;
 
-    if (hasTitle && hasCorpusName) {
-      // TITLE + NAME/SURNAME → high confidence
-      score = 0.95;
-    } else if (corpusCount >= 2) {
-      // NAME + NAME, NAME + SURNAME, etc. → high confidence
-      score = 0.9;
-    } else if (hasCorpusName && capitalizedCount > 0) {
-      // NAME/SURNAME + CAPITALIZED → medium confidence
-      score = 0.7;
-    } else if (hasAbbreviation && hasCorpusName) {
-      // ABBREVIATION + NAME/SURNAME → medium confidence
-      score = 0.7;
-    } else if (hasFirstName && chain.length === 1) {
-      // Standalone first NAME → low confidence
-      // Skip if at sentence start (likely not a name)
-      if (isSentenceStart(fullText, token.start)) {
+    if (hasNonWestern) {
+      // ── Non-Western scoring path ─────────────────
+      if (hasTitle && (nonWesternCount > 0 || capitalizedCount > 0)) {
+        score = 0.95;
+      } else if (hasJaSuffix && (capitalizedCount > 0 || nonWesternCount > 0)) {
+        score = 0.9;
+      } else if (hasArabicConnector && nonWesternCount > 0) {
+        score = 0.9;
+      } else if (nonWesternCount >= 2) {
+        score = 0.9;
+      } else if (
+        nonWesternCount > 0 &&
+        (capitalizedCount > 0 || hasAbbreviation)
+      ) {
+        score = 0.9;
+      } else if (
+        nonWesternCount === 1 &&
+        chain.length === 1 &&
+        !isSentenceStart(fullText, token.start)
+      ) {
+        // Standalone non-Western token mid-sentence
+        score = 0.5;
+      } else {
+        // Insufficient evidence for non-Western chain
         continue;
       }
-      // Standalone all-caps corpus hits are too
-      // ambiguous on their own to emit. "MARK" inside
-      // "SERVICE MARK LICENSE" matches the corpus but
-      // is plainly a common noun in context; we need
-      // chain evidence (another name token, a title,
-      // an abbreviation) before we trust an all-caps
-      // first-name token as a person.
-      const first = chain[0];
-      if (first && ALL_UPPER_RE.test(first.text) && first.text.length >= 3) {
-        continue;
-      }
-      score = 0.5;
-    } else if (
-      !hasFirstName &&
-      chain.length === 1 &&
-      chain[0]?.type === TOKEN_TYPE.SURNAME
-    ) {
-      // Standalone SURNAME → skip (too ambiguous alone)
-      continue;
-    } else if (hasTitle && chain.length === 1) {
-      // Standalone TITLE → skip (not a name by itself)
-      continue;
     } else {
-      // No corpus match in chain → skip
-      if (!hasCorpusName) {
+      // ── Western scoring path (unchanged) ─────────
+      if (hasTitle && hasCorpusName) {
+        // TITLE + NAME/SURNAME → high confidence
+        score = 0.95;
+      } else if (corpusCount >= 2) {
+        // NAME + NAME, NAME + SURNAME, etc. → high confidence
+        score = 0.9;
+      } else if (hasCorpusName && capitalizedCount > 0) {
+        // NAME/SURNAME + CAPITALIZED → medium confidence
+        score = 0.7;
+      } else if (hasAbbreviation && hasCorpusName) {
+        // ABBREVIATION + NAME/SURNAME → medium confidence
+        score = 0.7;
+      } else if (hasFirstName && chain.length === 1) {
+        // Standalone first NAME → low confidence
+        // Skip if at sentence start (likely not a name)
+        if (isSentenceStart(fullText, token.start)) {
+          continue;
+        }
+        // Standalone all-caps corpus hits are too
+        // ambiguous on their own to emit. "MARK" inside
+        // "SERVICE MARK LICENSE" matches the corpus but
+        // is plainly a common noun in context; we need
+        // chain evidence (another name token, a title,
+        // an abbreviation) before we trust an all-caps
+        // first-name token as a person.
+        const first = chain[0];
+        if (first && ALL_UPPER_RE.test(first.text) && first.text.length >= 3) {
+          continue;
+        }
+        score = 0.5;
+      } else if (
+        !hasFirstName &&
+        chain.length === 1 &&
+        chain[0]?.type === TOKEN_TYPE.SURNAME
+      ) {
+        // Standalone SURNAME → skip (too ambiguous alone)
         continue;
+      } else if (hasTitle && chain.length === 1) {
+        // Standalone TITLE → skip (not a name by itself)
+        continue;
+      } else if (hasJaSuffix || hasArabicConnector) {
+        // JA_SUFFIX or ARABIC_CONNECTOR without a name
+        // token is not a person by itself
+        if (!hasCorpusName && !hasFirstName) {
+          continue;
+        }
+        score = 0.5;
+      } else {
+        // No corpus match in chain → skip
+        if (!hasCorpusName) {
+          continue;
+        }
+        score = 0.5;
       }
-      score = 0.5;
     }
 
     // Build entity span from first to last token in chain
@@ -756,6 +1157,11 @@ export const detectNameCorpus = (
     const start = first.start;
     const end = last.end;
     const text = fullText.slice(start, end);
+
+    // Reject organization-like spans
+    if (isOrganization(text)) {
+      continue;
+    }
 
     // Mark all chain tokens as consumed
     for (let k = i; k < i + chain.length; k++) {
@@ -772,5 +1178,5 @@ export const detectNameCorpus = (
     });
   }
 
-  return entities;
+  return deduplicateSpans(entities);
 };

@@ -563,7 +563,8 @@ describe("contract snapshots", () => {
     test(
       fixture.name,
       async () => {
-        const fullText = readFileSync(fixture.textPath, "utf8");
+        const rawText = readFileSync(fixture.textPath, "utf8");
+        const fullText = rawText.replaceAll("\r\n", "\n");
         const entities = await runPipeline({
           fullText,
           config: { ...CONFIG, dictionaries: await getDictionaries() },
