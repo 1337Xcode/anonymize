@@ -15,7 +15,7 @@ import { POST_NOMINALS } from "../config/titles";
 import { getKnownLegalSuffixes } from "./legal-forms";
 import { NAME_PARTICLE } from "./signatures";
 import { loadLanguageConfigs } from "../util/lang-loader";
-import { DASH } from "../util/char-groups";
+import { DASH, DASH_INNER } from "../util/char-groups";
 
 const VALID_ID_VALIDATORS: Record<ValidIdValidator, Validator> = {
   "br.cpf": br.cpf,
@@ -664,6 +664,24 @@ const TRIGGER_LOOKAHEAD_MARGIN = 128;
 const LINE_TRIGGER_LOOKAHEAD = 2_048;
 const MATCH_PATTERN_LOOKAHEAD = 512;
 const PHONE_VALUE_START_RE = /^[+(\d]/;
+/**
+ * Phone-shaped run: an opening "+", "(", or digit, then
+ * any mix of digits, whitespace, parens, dots, slashes,
+ * and dash variants. The dash class includes every
+ * typographic dash (U+2011 non-breaking hyphen, U+2013
+ * en-dash, etc.) via `DASH_INNER` so a Unicode separator
+ * ("+1 555‑123‑4567") does not break the run and leave the
+ * number unredacted.
+ */
+const PHONE_SHAPE_PREFIX_RE = new RegExp(`^[+(\\d][\\d\\s()./${DASH_INNER}]*`);
+/**
+ * Optional phone-extension suffix following the numeric
+ * run: "ext", "ext.", "extension", or "x" (case-
+ * insensitive) plus 1-6 digits, with optional leading
+ * whitespace. Matches "+1 555 123 4567 ext. 89" and
+ * "555-1234 x42" so the shape bound keeps the extension.
+ */
+const PHONE_EXTENSION_SUFFIX_RE = /^\s*(?:ext\.?|extension|x)\s*\d{1,6}/i;
 const ISO_DATE_PREFIX_RE = /^\d{4}-\d{2}-\d{2}\b/;
 const INLINE_FIELD_LABEL_RE = /\b[\p{L}][\p{L}\p{M} /-]{1,32}:/u;
 const INLINE_FIELD_LABEL_STOP_RE =
@@ -885,6 +903,59 @@ const extractValue = (
         if (inlineLabel) {
           end = inlineLabel.index;
           foundLineStop = true;
+        }
+        // A phone value is digits plus separators and ends
+        // on a digit. Cut the capture at the end of the
+        // phone-shaped run so a mid-sentence trigger
+        // ("... phone +420 777 123 456. Signed on ...")
+        // cannot swallow the rest of a single-line
+        // paragraph through the line delimiter.
+        //
+        // A dot followed by whitespace is a sentence
+        // boundary, not a phone separator ("555.123.4567"
+        // has no whitespace after its dots), so bound the
+        // shape scan before the first ". " — otherwise the
+        // shape class (dot, space, digits) would run into a
+        // following numbered clause ("…123 456. 1. Defs…").
+        const region = valueText.slice(0, end);
+        const sentenceBreak = /\.\s/.exec(region);
+        const shapeRegion =
+          sentenceBreak !== null
+            ? region.slice(0, sentenceBreak.index)
+            : region;
+        const shape = PHONE_SHAPE_PREFIX_RE.exec(shapeRegion);
+        if (shape) {
+          // Trim trailing separators/whitespace so the run
+          // ends on a digit, then re-admit an optional
+          // extension suffix ("ext. 89", "x42") that sits
+          // just past the numeric run.
+          let shapeEnd = shape[0].replace(/\D+$/, "").length;
+          const extension = PHONE_EXTENSION_SUFFIX_RE.exec(
+            region.slice(shapeEnd),
+          );
+          if (extension !== null) {
+            shapeEnd += extension[0].length;
+          }
+          // Only bind when the phone shape stops before the
+          // current `end` — i.e. the shape, not a genuine
+          // line delimiter, is what terminates the value. A
+          // shape that runs all the way to a real newline/tab
+          // is a legitimate long labelled line and is left
+          // untouched (no cap), mirroring how newline-
+          // terminated bank-account values survive the cap.
+          if (shapeEnd > 0 && shapeEnd < end) {
+            // Apply the 100-char cap only to this shape-
+            // derived stop so a pathological all-digits run
+            // ("1 1 1 …" for hundreds of chars, with a later
+            // shape-breaking "Signed by …") cannot produce an
+            // over-long phone entity. Mirror the fallback's
+            // word-boundary retreat.
+            end =
+              shapeEnd > MAX_TRIGGER_VALUE_LEN
+                ? capAtWordBoundary(valueText, MAX_TRIGGER_VALUE_LEN)
+                : shapeEnd;
+            foundLineStop = true;
+          }
         }
       }
       // Cap only when no real line delimiter was found. HTML-
