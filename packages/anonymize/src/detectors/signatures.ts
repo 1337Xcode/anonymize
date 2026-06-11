@@ -65,8 +65,10 @@ const WITNESS_ANCHOR_RE = /\bIN WITNESS WHEREOF\b[^\n]*\n/gi;
 // Meer", "Vincent van Gogh", "Jean d'Arc"). Restricted
 // to a curated list of common particles so we don't
 // promote arbitrary lowercase prose into name shape.
-const NAME_PARTICLE =
-  "(?:de|del|della|der|den|di|du|el|la|le|van|von|y|zu|af|ben|bin|al|d'|d’)";
+// Shared with the trigger detector's person name-run
+// boundary (see detectors/triggers.ts).
+export const NAME_PARTICLE =
+  "(?:de|del|della|der|den|di|du|da|das|do|dos|el|la|le|van|von|y|zu|af|ben|bin|al|d'|d’)";
 const CAP_TOKEN = "\\p{Lu}[\\p{L}\\p{M}.'\\-]{0,30}";
 // A name: starts with a cap token, then 1-4 more
 // tokens which may be cap tokens or lowercase
