@@ -191,6 +191,19 @@ describe("Non-Western Name Detection", () => {
       expect(matches[0]?.text).toBe("張小明");
     });
 
+    test("Japanese Han name (田中太郎)", async () => {
+      const matches = persons(await detect("The director signed as 田中太郎."));
+      expect(matches.length).toBe(1);
+      expect(matches[0]?.text).toBe("田中太郎");
+    });
+
+    test("common CJK non-person terms are ignored", async () => {
+      const matches = persons(
+        await detect("The document mentions 香港 and 中文."),
+      );
+      expect(matches.length).toBe(0);
+    });
+
     test("CJK not detected in CJK-majority document", async () => {
       // A document with >15% Han characters should not trigger CJK name detection
       const cjkMajority =

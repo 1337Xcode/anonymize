@@ -520,6 +520,101 @@ const CJK_NAME_RE =
 /** Han character threshold for CJK-majority documents. */
 const CJK_HAN_RATIO = 0.15;
 
+const CJK_NON_PERSON_TERMS = new Set([
+  "中国",
+  "中國",
+  "中文",
+  "人民",
+  "公司",
+  "香港",
+  "台湾",
+  "臺灣",
+  "日本",
+  "韩国",
+  "韓國",
+]);
+
+const CJK_SURNAME_CHARS = new Set(
+  [
+    "王",
+    "李",
+    "张",
+    "張",
+    "刘",
+    "劉",
+    "陈",
+    "陳",
+    "杨",
+    "楊",
+    "黄",
+    "黃",
+    "赵",
+    "趙",
+    "吴",
+    "吳",
+    "周",
+    "徐",
+    "孙",
+    "孫",
+    "马",
+    "馬",
+    "朱",
+    "胡",
+    "郭",
+    "何",
+    "林",
+    "高",
+    "梁",
+    "郑",
+    "鄭",
+    "罗",
+    "羅",
+    "宋",
+    "谢",
+    "謝",
+    "唐",
+    "韩",
+    "韓",
+    "曹",
+    "许",
+    "許",
+    "邓",
+    "鄧",
+    "萧",
+    "蕭",
+    "田",
+    "山",
+    "佐",
+    "鈴",
+    "渡",
+    "伊",
+    "中",
+    "小",
+    "吉",
+    "金",
+    "朴",
+    "박",
+    "김",
+    "이",
+    "최",
+    "정",
+    "강",
+    "조",
+    "윤",
+    "장",
+    "임",
+    "한",
+  ].join(""),
+);
+
+const isLikelyCjkPersonName = (text: string): boolean => {
+  if (CJK_NON_PERSON_TERMS.has(text)) {
+    return false;
+  }
+  const first = text.at(0);
+  return first !== undefined && CJK_SURNAME_CHARS.has(first);
+};
+
 /** Organization keyword filter. */
 const ORG_WORDS =
   /\b(?:Group|Company|LLC|LLP|LP|Inc|Ltd|Corp|Corporation|Holdings|Partners|Association|University|Bank|Fund|Trust|Agency|Government|Ministry|Office|Department|Council|Board|Committee|Commission|Services|Solutions|Technologies|Systems|Analytics|Software)\b/i;
@@ -913,7 +1008,7 @@ export const detectNameCorpus = (
     let match: RegExpExecArray | null;
     while ((match = CJK_NAME_RE.exec(fullText)) !== null) {
       const cjkText = match[0];
-      if (!isOrganization(cjkText)) {
+      if (isLikelyCjkPersonName(cjkText) && !isOrganization(cjkText)) {
         entities.push({
           start: match.index,
           end: match.index + cjkText.length,
