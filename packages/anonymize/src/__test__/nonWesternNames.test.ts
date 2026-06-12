@@ -34,6 +34,16 @@ const detect = async (text: string): Promise<Entity[]> => {
   });
 };
 
+const detectWithDenyList = async (text: string): Promise<Entity[]> => {
+  const context = createPipelineContext();
+  return runPipeline({
+    fullText: text,
+    config: { ...baseConfig, enableDenyList: true },
+    gazetteerEntries: [],
+    context,
+  });
+};
+
 /** Direct detector call; returns raw entities without pipeline post-processing. */
 const directCtx = createPipelineContext();
 let directCtxReady = false;
@@ -609,6 +619,15 @@ describe("Non-Western Name Detection", () => {
       expect(matches.every((m) => !m.text.includes("Justice. Kumar"))).toBe(
         true,
       );
+    });
+
+    test("title-only deny-list hits are not extended into person spans", async () => {
+      const matches = persons(
+        await detectWithDenyList(
+          "The Hon'ble Court considered the appeal. Ong Agreement followed.",
+        ),
+      );
+      expect(matches.length).toBe(0);
     });
   });
 

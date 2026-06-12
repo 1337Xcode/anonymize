@@ -484,6 +484,9 @@ const patternSources = (
   return Array.isArray(sources) ? sources : [sources];
 };
 
+const hasPersonNameSource = (match: RawMatch): boolean =>
+  match.sources.includes("first-name") || match.sources.includes("surname");
+
 const addPatternLabel = (
   list: PatternLabels[],
   index: number,
@@ -1210,6 +1213,9 @@ export const processDenyListMatches = (
     const first = chain.at(0);
     const last = chain.at(-1);
     if (!first || !last) {
+      continue;
+    }
+    if (!chain.some(hasPersonNameSource)) {
       continue;
     }
 
