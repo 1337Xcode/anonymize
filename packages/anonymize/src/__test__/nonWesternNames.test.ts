@@ -636,6 +636,40 @@ describe("Non-Western Name Detection", () => {
       );
       expect(matches.length).toBe(0);
     });
+
+    test("deny-list mode keeps supplemental CJK name detection", async () => {
+      const matches = persons(await detectWithDenyList("Signed by 田中太郎."));
+      expect(matches.length).toBe(1);
+      expect(matches[0]?.text).toBe("田中太郎");
+    });
+
+    test("deny-list mode keeps CJK non-person terms suppressed", async () => {
+      const matches = persons(
+        await detectWithDenyList("The document mentions 香港 and 中文."),
+      );
+      expect(matches.length).toBe(0);
+    });
+
+    test("deny-list mode keeps high-evidence non-Western chains", async () => {
+      const matches = persons(
+        await detectWithDenyList("The lead researcher was SATO Kenji."),
+      );
+      expect(matches.some((m) => m.text === "SATO Kenji")).toBe(true);
+    });
+
+    test("deny-list supplemental mode does not emit bare non-Western tokens", async () => {
+      const matches = persons(
+        await detectWithDenyList("The witness Sato testified."),
+      );
+      expect(matches.length).toBe(0);
+    });
+
+    test("deny-list mode keeps ordinary Western names on deny-list path", async () => {
+      const matches = persons(await detectWithDenyList("John Smith signed."));
+      expect(matches.length).toBe(1);
+      expect(matches[0]?.text).toBe("John Smith");
+      expect(matches[0]?.source).toBe("deny-list");
+    });
   });
 
   // ── Offset accuracy ────────────────────────────────────────────────

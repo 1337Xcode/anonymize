@@ -481,6 +481,10 @@ type ClassifiedToken = {
 
 const PERSON_CHAIN_BREAK_RE = /[!?;:]/u;
 
+type NameCorpusDetectionOptions = {
+  mode?: "full" | "supplemental";
+};
+
 const isInitialContinuationGap = (text: string, gap: string): boolean =>
   (/^\p{Lu}$/u.test(text) && /^\.[^\S\n]{1,2}$/u.test(gap)) ||
   /^[^\S\n]{1,2}(?:\p{Lu}\.[^\S\n]{1,2})+$/u.test(gap);
@@ -1022,12 +1026,14 @@ const classifyToken = (
 export const detectNameCorpus = (
   fullText: string,
   ctx: PipelineContext = defaultContext,
+  options: NameCorpusDetectionOptions = {},
 ): Entity[] => {
   const corpus = getCorpus(ctx);
   if (!corpus) {
     return [];
   }
 
+  const supplementalMode = options.mode === "supplemental";
   const entities: Entity[] = [];
 
   // ── CJK pre-pass ─────────────────────────────────
@@ -1222,6 +1228,11 @@ export const detectNameCorpus = (
         // Insufficient evidence for non-Western chain
         continue;
       }
+      if (supplementalMode && score < 0.9) {
+        continue;
+      }
+    } else if (supplementalMode) {
+      continue;
     } else {
       // ── Western scoring path (unchanged) ─────────
       if (hasTitle && hasCorpusName) {
