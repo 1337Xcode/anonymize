@@ -163,7 +163,7 @@ export const HONORIFIC_BOUNDARY = new Set([
  * Honorifics that are abbreviations: a dot after them is an
  * abbreviation dot (same sentence), so the detector keeps an
  * optional `.` between the title and the name ("Mr. Smith").
- * Every other honorific is a full word — a trailing dot ends a
+ * Every other honorific is a full word; a trailing dot ends a
  * sentence, so the detector must NOT consume it (otherwise a span
  * like "President. The Employee" crosses the sentence boundary).
  *
@@ -230,3 +230,82 @@ export const POST_NOMINALS = [
   "KC",
   "QC",
 ] as const;
+
+export const NONWESTERN_HONORIFICS = {
+  in: [
+    "Sri",
+    "Shri",
+    "Smt",
+    "Smt.",
+    "Kumari",
+    "Pandit",
+    "Pt.",
+    "Adv.",
+    "Adv",
+    "Justice",
+    "Hon'ble",
+  ],
+  ar: [
+    "Al-",
+    "El-",
+    "Sheikh",
+    "Shaikh",
+    "Sheikha",
+    "Ustaz",
+    "Ustaza",
+    "Abu",
+    "Umm",
+  ],
+  "zh-Latn": [
+    "Encik",
+    "Puan",
+    "Datuk",
+    "Dato'",
+    "Dato",
+    "Tan Sri",
+    "Tun",
+  ] as const,
+  "ja-Latn": ["-san", "-sama", "-sensei", "Mr.", "Ms."] as const,
+  ko: ["Sunsaeng", "Gyosu"] as const,
+  th: [
+    "Khun",
+    "Nai",
+    "Nang",
+    "Khunying",
+    "Luang",
+    "Phra",
+    "Mom",
+    "Momluang",
+    "Mommuen",
+    "Momratchawong",
+  ] as const,
+  vi: ["Ông", "Ong", "Ba", "Co"] as const,
+  fil: [
+    "Atty.",
+    "Atty",
+    "Ginoo",
+    "Ginang",
+    "Binibini",
+    "G.",
+    "Gng.",
+    "Bb.",
+  ] as const,
+  id: [
+    "Bapak",
+    "Ibu",
+    "Pak",
+    "Bu",
+    "Raden",
+    "Tuan",
+    "Nyonya",
+    "Nona",
+    "Haji",
+    "Hajjah",
+    "H.",
+    "Hj.",
+    "S.H.",
+    "S.H",
+    "Ir.",
+    "Drs.",
+  ] as const,
+} as const;

@@ -30,12 +30,23 @@ export type NameCorpusData = {
   firstNames: ReadonlySet<string>;
   surnames: ReadonlySet<string>;
   titleTokens: ReadonlySet<string>;
+  /** Abbreviation-style titles whose trailing dot is
+   *  part of the title, not a sentence boundary.
+   *  Contains the lowercase, dot-stripped form
+   *  (e.g., "dr", "smt", "atty"). */
+  titleAbbreviations: ReadonlySet<string>;
   excludedWords: ReadonlySet<string>;
+  /** Non-Western name tokens merged across all locales. */
+  nonWesternNames: ReadonlySet<string>;
+  /** All-caps acronyms excluded from name detection. */
+  excludedAllCaps: ReadonlySet<string>;
   /** Raw arrays exposed for deny-list AC integration. */
   firstNamesList: readonly string[];
   surnamesList: readonly string[];
   titlesList: readonly string[];
   excludedList: readonly string[];
+  nonWesternNamesList: readonly string[];
+  excludedAllCapsList: readonly string[];
 };
 
 /**

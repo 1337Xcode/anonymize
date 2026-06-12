@@ -86,6 +86,25 @@ const isCallerOwnedEntity = (entity: Entity): boolean =>
 const hasLockedBoundary = (entity: Entity): boolean =>
   isCallerOwnedEntity(entity);
 
+const isCoveredByDenyListEntity = (
+  entity: Entity,
+  denyListEntity: Entity,
+): boolean =>
+  entity.label === denyListEntity.label &&
+  denyListEntity.start <= entity.start &&
+  denyListEntity.end >= entity.end;
+
+const filterNameCorpusCoveredByDenyList = (
+  nameCorpusEntities: readonly Entity[],
+  denyListEntities: readonly Entity[],
+): Entity[] =>
+  nameCorpusEntities.filter(
+    (entity) =>
+      !denyListEntities.some((denyListEntity) =>
+        isCoveredByDenyListEntity(entity, denyListEntity),
+      ),
+  );
+
 const LITERAL_BOUNDARY_PUNCT_RE = /^["“„‟‘‛'«]|["”’'»!.]$/u;
 
 // Bare postal-code shapes used by the address-containment rule.
@@ -1275,6 +1294,20 @@ export const runPipeline = async (
   );
   if (denyListEntities.length > 0)
     log("deny-list", `${denyListEntities.length} matches`);
+
+  if (config.enableNameCorpus && config.enableDenyList) {
+    await initNameCorpus(ctx, config.dictionaries, config.nameCorpusLanguages);
+    checkAbort(signal);
+    rawNameCorpusEntities = filterNameCorpusCoveredByDenyList(
+      detectNameCorpus(fullText, ctx, { mode: "supplemental" }),
+      rawDenyListEntities,
+    );
+    nameCorpusEntities = filterAllowedLabels(
+      rawNameCorpusEntities,
+      preHotwordAllowedLabels,
+    );
+    log("name-corpus", `${nameCorpusEntities.length} supplemental matches`);
+  }
 
   // Gazetteer: unified into tsLiterals
   const rawGazetteerEntities =
